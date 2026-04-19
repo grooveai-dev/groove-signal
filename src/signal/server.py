@@ -28,11 +28,15 @@ import argparse
 import asyncio
 import json
 import logging
+import os
+import re
+import secrets
 import ssl
 import sys
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 from websockets.asyncio.server import serve, ServerConnection
@@ -41,6 +45,8 @@ from websockets.exceptions import ConnectionClosed
 from src.common.protocol import (
     ASSIGN_LAYERS,
     ASSIGNMENT_ACK,
+    AUTH_CHALLENGE,
+    AUTH_RESPONSE,
     DEREGISTER,
     ENVELOPE,
     ERROR,
@@ -57,6 +63,7 @@ from src.common.protocol import (
     decode_message,
     encode_message,
     make_assign_layers,
+    make_auth_challenge,
     make_error,
     make_pipeline_config,
     make_rebalance,
@@ -72,6 +79,7 @@ from src.relay.scheduler import (
     get_model_info,
     validate_coverage,
 )
+from src.node.identity import address_from_public_key, verify_signature
 from src.signal.matcher import ConsumerMatcher
 from src.signal.registry import NodeRecord, NodeRegistry
 from src.signal.scoring import configure_geoip, estimate_location_from_ip
@@ -109,6 +117,8 @@ class JsonFormatter(logging.Formatter):
 
 logger = logging.getLogger("signal")
 
+_NODE_ID_RE = re.compile(r'^0x[0-9a-fA-F]{40}$')
+
 
 # ---------------------------------------------------------------------------
 # Consumer stream state (mirrors relay's ConsumerEntry)
@@ -123,6 +133,7 @@ class ConsumerStream:
     created_at: float = field(default_factory=time.time)
     last_activity: float = field(default_factory=time.time)
     envelope_counts: dict[str, int] = field(default_factory=dict)
+    last_envelope_count: dict[str, int] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +173,7 @@ class SignalServer:
         http_port: int = 8771,
         tls_cert: str | None = None,
         tls_key: str | None = None,
-        cors_origin: str = "*",
+        cors_origin: str | None = None,
         max_connections_per_ip: int = 20,
         max_nodes: int = 10_000,
         max_streams: int = 50_000,
@@ -170,6 +181,7 @@ class SignalServer:
         session_idle_timeout: float = 300.0,
         scoring_weights: dict | None = None,
         signal_id: str | None = None,
+        require_auth: bool = True,
     ) -> None:
         self.host = host
         self.port = port
@@ -185,6 +197,8 @@ class SignalServer:
         self.scoring_weights = scoring_weights
         self.signal_id = signal_id or uuid.uuid4().hex
 
+        self.require_auth = require_auth
+
         self.registry = NodeRegistry()
         self.matcher = ConsumerMatcher(self.registry, scorer_weights=scoring_weights)
 
@@ -194,6 +208,13 @@ class SignalServer:
         self._sched_lock = asyncio.Lock()
         self._connections_per_ip: dict[str, int] = {}
         self._node_streams: dict[str, set[str]] = {}
+        self._rate_limiters_per_ip: dict[str, _RateLimiter] = {}
+
+        dashboard_path = Path(__file__).parent / "dashboard.html"
+        try:
+            self._dashboard_html = dashboard_path.read_bytes()
+        except FileNotFoundError:
+            self._dashboard_html = b"dashboard not found"
 
     # ---- helpers -------------------------------------------------------
     def _active_assignments_for_model(
@@ -245,6 +266,51 @@ class SignalServer:
                 extra={"stream_id": sid, "reason": "node_gone", "node_id": node_id},
             )
 
+    async def _authenticate_node(
+        self, ws: ServerConnection, node_id: str, public_key: str | None,
+    ) -> bool:
+        """Challenge-response authentication. Returns True on success."""
+        if not self.require_auth:
+            return True
+        if not public_key:
+            await self._send_error(ws, "", "AUTH_REQUIRED",
+                                   "registration requires public_key for authentication")
+            return False
+        try:
+            derived = address_from_public_key(public_key)
+        except (ValueError, Exception):
+            await self._send_error(ws, "", "AUTH_FAILED", "invalid public key")
+            return False
+        if derived.lower() != node_id.lower():
+            await self._send_error(ws, "", "AUTH_FAILED",
+                                   "public key does not match claimed node_id")
+            return False
+        nonce = secrets.token_hex(32)
+        challenge = make_auth_challenge(node_id, nonce)
+        if not await self._safe_send(ws, encode_message(challenge)):
+            return False
+        try:
+            raw_auth = await asyncio.wait_for(ws.recv(), timeout=10.0)
+        except (asyncio.TimeoutError, ConnectionClosed):
+            return False
+        if isinstance(raw_auth, str):
+            raw_auth = raw_auth.encode("utf-8")
+        try:
+            auth_msg = decode_message(raw_auth)
+        except Exception:
+            await self._send_error(ws, "", "AUTH_FAILED", "invalid auth response")
+            return False
+        if auth_msg.get("type") != AUTH_RESPONSE:
+            await self._send_error(ws, "", "AUTH_FAILED", "expected auth_response")
+            return False
+        signature = auth_msg.get("signature", "")
+        if not verify_signature(nonce.encode("utf-8"), signature, public_key):
+            await self._send_error(ws, "", "AUTH_FAILED",
+                                   "signature verification failed")
+            return False
+        logger.info("node authenticated", extra={"node_id": node_id})
+        return True
+
     # ---- node connection handler --------------------------------------
     async def _handle_node(self, ws: ServerConnection, first: dict) -> None:
         """Handle a node's persistent outbound connection.
@@ -265,18 +331,26 @@ class SignalServer:
         if not node_id:
             await self._send_error(ws, "", "BAD_HELLO", "missing node_id")
             return
+        if not _NODE_ID_RE.match(node_id):
+            await self._send_error(ws, "", "BAD_HELLO", "invalid node_id format")
+            return
         if self.registry.node_count() >= self.max_nodes:
             await self._send_error(ws, "", "CAPACITY", "node limit reached")
             return
 
+        if not await self._authenticate_node(ws, node_id, first.get("public_key")):
+            try:
+                await ws.close()
+            except (ConnectionClosed, OSError):
+                pass
+            return
+
         caps = normalize_capabilities(first.get("capabilities"))
         models_supported = first.get("models_supported") or []
-        location = first.get("location")
 
-        # If the node didn't self-declare a location, try to geolocate its IP.
-        if not location:
-            ip = ws.remote_address[0] if ws.remote_address else ""
-            location = estimate_location_from_ip(ip)
+        # Always derive location from IP, never trust self-reported.
+        ip = ws.remote_address[0] if ws.remote_address else ""
+        location = estimate_location_from_ip(ip)
 
         # Pre-existing record: close the stale socket before replacing.
         existing = self.registry.get_node(node_id)
@@ -342,7 +416,8 @@ class SignalServer:
         self, ws: ServerConnection, record: NodeRecord,
     ) -> None:
         node_id = record.node_id
-        limiter = _RateLimiter()
+        ip = ws.remote_address[0] if ws.remote_address else "unknown"
+        limiter = self._rate_limiters_per_ip.setdefault(ip, _RateLimiter())
         try:
             async for raw in ws:
                 if not limiter.allow():
@@ -618,11 +693,12 @@ class SignalServer:
         inference traffic through the signal must follow up with a
         SESSION_INIT (relay-compatible path).
         """
-        session_id = msg.get("session_id") or uuid.uuid4().hex
+        raw_sid = msg.get("session_id") or ""
+        session_id = raw_sid if re.match(r'^[a-f0-9]{32}$', raw_sid) else uuid.uuid4().hex
         model_name = msg.get("model_name") or ""
         consumer_location = msg.get("consumer_location")
         requirements = msg.get("requirements") or {}
-        top_n = int(msg.get("top_n") or 10)
+        top_n = min(max(1, int(msg.get("top_n") or 10)), 100)
 
         # If the consumer didn't send a location, try to geolocate.
         if not consumer_location:
@@ -667,7 +743,8 @@ class SignalServer:
         self, ws: ServerConnection, first: dict,
     ) -> None:
         """Consumer opened a relay session — assemble a scored pipeline."""
-        session_id = first.get("session_id") or uuid.uuid4().hex
+        raw_sid = first.get("session_id") or ""
+        session_id = raw_sid if re.match(r'^[a-f0-9]{32}$', raw_sid) else uuid.uuid4().hex
         model_name = first.get("model_name", "")
         pv = first.get("protocol_version")
         if pv != PROTOCOL_VERSION:
@@ -748,7 +825,8 @@ class SignalServer:
         ce: ConsumerStream,
         pipeline_ids: list[str],
     ) -> None:
-        limiter = _RateLimiter()
+        ip = ce.ws.remote_address[0] if ce.ws.remote_address else "unknown"
+        limiter = self._rate_limiters_per_ip.setdefault(ip, _RateLimiter())
         try:
             async for raw in ws:
                 if not limiter.allow():
@@ -793,6 +871,17 @@ class SignalServer:
                     continue
 
                 msg["stream_id"] = ce.stream_id
+
+                count = msg.get("envelope_count", 0)
+                last = ce.last_envelope_count.get(target, -1)
+                if count <= last:
+                    await self._send_error(
+                        ws, ce.session_id, "REPLAY",
+                        "envelope_count not monotonically increasing",
+                    )
+                    continue
+                ce.last_envelope_count[target] = count
+
                 ce.envelope_counts[target] = ce.envelope_counts.get(target, 0) + 1
                 ce.last_activity = time.time()
                 ok = await self._safe_send(record.ws, encode_message(msg))
@@ -939,14 +1028,19 @@ class SignalServer:
         body: bytes,
         content_type: str = "text/plain; charset=utf-8",
     ) -> None:
+        cors_headers = ""
+        if self.cors_origin:
+            cors_headers = (
+                f"Access-Control-Allow-Origin: {self.cors_origin}\r\n"
+                "Access-Control-Allow-Methods: GET, OPTIONS\r\n"
+                "Access-Control-Allow-Headers: Content-Type\r\n"
+            )
         headers = (
             f"HTTP/1.1 {status_code} {status_text}\r\n"
             f"Content-Type: {content_type}\r\n"
             f"Content-Length: {len(body)}\r\n"
             "Connection: close\r\n"
-            f"Access-Control-Allow-Origin: {self.cors_origin}\r\n"
-            "Access-Control-Allow-Methods: GET, OPTIONS\r\n"
-            "Access-Control-Allow-Headers: Content-Type\r\n"
+            f"{cors_headers}"
             "\r\n"
         )
         writer.write(headers.encode("ascii") + body)
@@ -995,6 +1089,12 @@ class SignalServer:
                 return
 
             clean_path = path.split("?", 1)[0]
+            if clean_path in ("/", ""):
+                await self._http_respond(
+                    writer, 200, "OK", self._dashboard_html,
+                    content_type="text/html; charset=utf-8",
+                )
+                return
             if clean_path == "/status":
                 body = json.dumps(self.build_status()).encode("utf-8")
                 await self._http_respond(
@@ -1021,12 +1121,21 @@ class SignalServer:
     # ---- monitors ------------------------------------------------------
     async def monitor_heartbeats(self) -> None:
         while True:
-            stale = self.registry.cleanup_stale(self.heartbeat_timeout)
-            for nid in stale:
+            now = time.time()
+            stale_records = [
+                (nid, record) for nid, record in self.registry.nodes.items()
+                if (now - record.last_heartbeat) > self.heartbeat_timeout
+            ]
+            for nid, record in stale_records:
                 logger.warning(
                     "node stale — no heartbeat",
                     extra={"node_id": nid, "timeout_s": self.heartbeat_timeout},
                 )
+                self.registry.deregister(nid)
+                try:
+                    await record.ws.close()
+                except (ConnectionClosed, OSError):
+                    pass
                 await self._teardown_streams_using_node(nid)
             await asyncio.sleep(5.0)
 
@@ -1063,6 +1172,7 @@ class SignalServer:
         ssl_ctx = None
         if self.tls_cert and self.tls_key:
             ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
             ssl_ctx.load_cert_chain(self.tls_cert, self.tls_key)
             logger.info("TLS enabled for WebSocket and HTTP")
 
@@ -1084,6 +1194,8 @@ class SignalServer:
             self.port,
             max_size=self.max_message_size,
             ssl=ssl_ctx,
+            ping_interval=30,
+            ping_timeout=10,
         ), http_server:
             ws_scheme = "wss" if ssl_ctx else "ws"
             logger.info(
@@ -1129,6 +1241,10 @@ async def main() -> None:
         "--signal-id", default=None,
         help="Stable identifier for this signal operator (auto-generated if omitted)",
     )
+    parser.add_argument(
+        "--no-auth", action="store_true",
+        help="Disable challenge-response node authentication (dev only)",
+    )
     args = parser.parse_args()
     configure_logging(args.log_level)
 
@@ -1156,6 +1272,7 @@ async def main() -> None:
         max_message_size=args.max_message_size,
         scoring_weights=weights,
         signal_id=args.signal_id,
+        require_auth=not args.no_auth,
     )
     await signal.start()
 

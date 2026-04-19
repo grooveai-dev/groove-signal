@@ -1,0 +1,571 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Groove Signal</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
+
+  :root {
+    --surface-0: #1a1e25;
+    --surface-1: #1e2127;
+    --surface-2: #24282f;
+    --surface-3: #282c34;
+    --surface-4: #2c313a;
+    --surface-5: #333842;
+    --surface-6: #3a3f4b;
+    --text-0: #e6e6e6;
+    --text-1: #bcc2cd;
+    --text-2: #8b929e;
+    --text-3: #6e7681;
+    --text-4: #505862;
+    --border: #3e4451;
+    --border-subtle: #2c313a;
+    --accent: #33afbc;
+    --success: #4ae168;
+    --warning: #e5c07b;
+    --danger: #e06c75;
+    --info: #61afef;
+    --purple: #c678dd;
+    --orange: #d19a66;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--surface-0);
+    color: var(--text-1);
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    min-height: 100vh;
+  }
+
+  .mono { font-family: 'JetBrains Mono', 'SF Mono', 'Fira Code', 'Consolas', monospace; }
+
+  .container {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 24px 20px;
+  }
+
+  /* Header */
+  .header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 24px;
+    padding-bottom: 16px;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  .header-left { display: flex; align-items: center; gap: 12px; }
+  .header h1 {
+    font-size: 18px;
+    font-weight: 600;
+    color: var(--text-0);
+    letter-spacing: -0.3px;
+  }
+  .header h1 span { color: var(--accent); }
+  .version {
+    font-size: 11px;
+    color: var(--text-3);
+    background: var(--surface-4);
+    padding: 2px 8px;
+    border-radius: 4px;
+  }
+  .live-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--success);
+    box-shadow: 0 0 6px rgba(74, 225, 104, 0.4);
+    animation: pulse-dot 2s ease-in-out infinite;
+  }
+  @keyframes pulse-dot {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+  }
+  .header-right {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-size: 12px;
+    color: var(--text-3);
+  }
+
+  /* Stats Grid */
+  .stats-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px;
+    margin-bottom: 24px;
+  }
+  .stat-card {
+    background: var(--surface-1);
+    border: 1px solid var(--border-subtle);
+    border-radius: 6px;
+    padding: 16px;
+  }
+  .stat-label {
+    font-size: 11px;
+    color: var(--text-3);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 6px;
+  }
+  .stat-value {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 28px;
+    font-weight: 500;
+    color: var(--text-0);
+    line-height: 1.2;
+  }
+  .stat-value.accent { color: var(--accent); }
+  .stat-value.success { color: var(--success); }
+  .stat-value.warning { color: var(--warning); }
+  .stat-sub {
+    font-size: 11px;
+    color: var(--text-3);
+    margin-top: 4px;
+  }
+
+  /* Panels */
+  .panels {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    margin-bottom: 24px;
+  }
+  .panel {
+    background: var(--surface-1);
+    border: 1px solid var(--border-subtle);
+    border-radius: 6px;
+    overflow: hidden;
+  }
+  .panel-full {
+    grid-column: 1 / -1;
+  }
+  .panel-header {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border-subtle);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .panel-title {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-0);
+  }
+  .panel-badge {
+    font-size: 10px;
+    font-family: 'JetBrains Mono', monospace;
+    padding: 2px 6px;
+    border-radius: 4px;
+    background: rgba(51, 175, 188, 0.12);
+    color: var(--accent);
+    border: 1px solid rgba(51, 175, 188, 0.15);
+  }
+  .panel-body {
+    padding: 0;
+  }
+
+  /* Table */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+  }
+  th {
+    text-align: left;
+    padding: 8px 16px;
+    font-size: 10px;
+    font-weight: 500;
+    color: var(--text-3);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    background: var(--surface-2);
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  td {
+    padding: 8px 16px;
+    font-size: 13px;
+    border-bottom: 1px solid var(--border-subtle);
+    white-space: nowrap;
+  }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: var(--surface-2); }
+
+  .node-id {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    color: var(--accent);
+  }
+
+  /* Status badges */
+  .badge {
+    display: inline-block;
+    font-size: 10px;
+    font-weight: 500;
+    padding: 2px 8px;
+    border-radius: 4px;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+  }
+  .badge-active {
+    background: rgba(74, 225, 104, 0.12);
+    color: var(--success);
+    border: 1px solid rgba(74, 225, 104, 0.15);
+  }
+  .badge-pending {
+    background: rgba(229, 192, 123, 0.12);
+    color: var(--warning);
+    border: 1px solid rgba(229, 192, 123, 0.15);
+  }
+  .badge-loading {
+    background: rgba(97, 175, 239, 0.12);
+    color: var(--info);
+    border: 1px solid rgba(97, 175, 239, 0.15);
+  }
+
+  /* Coverage bar */
+  .coverage-bar-wrap {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .coverage-bar {
+    flex: 1;
+    height: 6px;
+    background: var(--surface-4);
+    border-radius: 3px;
+    overflow: hidden;
+  }
+  .coverage-fill {
+    height: 100%;
+    border-radius: 3px;
+    transition: width 0.5s ease;
+  }
+  .coverage-fill.full { background: var(--success); }
+  .coverage-fill.partial { background: var(--warning); }
+  .coverage-fill.empty { background: var(--surface-5); }
+  .coverage-label {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    color: var(--text-2);
+    min-width: 60px;
+    text-align: right;
+  }
+
+  /* Model card */
+  .model-row {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  .model-row:last-child { border-bottom: none; }
+  .model-name {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    color: var(--text-0);
+    margin-bottom: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  /* Signal info */
+  .info-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0;
+  }
+  .info-row {
+    display: flex;
+    justify-content: space-between;
+    padding: 8px 16px;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  .info-row:last-child { border-bottom: none; }
+  .info-key {
+    font-size: 12px;
+    color: var(--text-3);
+  }
+  .info-val {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    color: var(--text-1);
+  }
+
+  /* Empty state */
+  .empty {
+    padding: 32px 16px;
+    text-align: center;
+    color: var(--text-3);
+    font-size: 13px;
+  }
+  .empty-icon {
+    font-size: 24px;
+    margin-bottom: 8px;
+    opacity: 0.4;
+  }
+
+  /* Footer */
+  .footer {
+    text-align: center;
+    padding: 16px 0;
+    font-size: 11px;
+    color: var(--text-4);
+    border-top: 1px solid var(--border-subtle);
+  }
+  .footer a {
+    color: var(--accent);
+    text-decoration: none;
+  }
+
+  /* Responsive */
+  @media (max-width: 768px) {
+    .stats-grid { grid-template-columns: repeat(2, 1fr); }
+    .panels { grid-template-columns: 1fr; }
+    .info-grid { grid-template-columns: 1fr; }
+  }
+
+  /* Device icons */
+  .device-tag {
+    font-size: 11px;
+    font-family: 'JetBrains Mono', monospace;
+    padding: 1px 6px;
+    border-radius: 3px;
+  }
+  .device-cuda {
+    background: rgba(74, 225, 104, 0.1);
+    color: var(--success);
+  }
+  .device-mps {
+    background: rgba(198, 120, 221, 0.1);
+    color: var(--purple);
+  }
+  .device-cpu {
+    background: rgba(209, 154, 102, 0.1);
+    color: var(--orange);
+  }
+</style>
+</head>
+<body>
+
+<div class="container">
+  <div class="header">
+    <div class="header-left">
+      <h1><span>groove</span> signal</h1>
+      <span class="version mono">v0.1.0</span>
+      <div class="live-dot" id="live-dot" title="Connected"></div>
+    </div>
+    <div class="header-right">
+      <span class="mono" id="signal-id"></span>
+      <span id="uptime"></span>
+      <span id="last-update"></span>
+    </div>
+  </div>
+
+  <div class="stats-grid">
+    <div class="stat-card">
+      <div class="stat-label">Nodes Online</div>
+      <div class="stat-value accent" id="total-nodes">-</div>
+      <div class="stat-sub" id="nodes-sub"></div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Active Sessions</div>
+      <div class="stat-value" id="active-sessions">-</div>
+      <div class="stat-sub" id="sessions-sub"></div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Models Available</div>
+      <div class="stat-value success" id="models-available">-</div>
+      <div class="stat-sub" id="models-sub"></div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Uptime</div>
+      <div class="stat-value" id="uptime-value">-</div>
+      <div class="stat-sub" id="uptime-sub"></div>
+    </div>
+  </div>
+
+  <div class="panels">
+    <div class="panel panel-full">
+      <div class="panel-header">
+        <span class="panel-title">Registered Nodes</span>
+        <span class="panel-badge" id="node-count-badge">0</span>
+      </div>
+      <div class="panel-body" id="nodes-panel">
+        <div class="empty">
+          <div class="empty-icon">~</div>
+          Waiting for nodes to connect...
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">Model Coverage</span>
+      </div>
+      <div class="panel-body" id="models-panel">
+        <div class="empty">
+          <div class="empty-icon">~</div>
+          No models registered
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">Signal Info</span>
+      </div>
+      <div class="panel-body" id="info-panel"></div>
+    </div>
+  </div>
+
+  <div class="footer">
+    groove signal service &middot; <a href="/status">/status</a> &middot; <a href="/health">/health</a>
+  </div>
+</div>
+
+<script>
+const $ = (s) => document.getElementById(s);
+
+function formatUptime(secs) {
+  if (secs < 60) return secs + 's';
+  if (secs < 3600) return Math.floor(secs / 60) + 'm ' + (secs % 60) + 's';
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  if (h < 24) return h + 'h ' + m + 'm';
+  const d = Math.floor(h / 24);
+  return d + 'd ' + (h % 24) + 'h';
+}
+
+function deviceClass(d) {
+  if (d === 'cuda') return 'device-cuda';
+  if (d === 'mps') return 'device-mps';
+  return 'device-cpu';
+}
+
+function badgeClass(status) {
+  if (status === 'active') return 'badge-active';
+  if (status === 'loading') return 'badge-loading';
+  return 'badge-pending';
+}
+
+function renderNodes(nodes) {
+  const panel = $('nodes-panel');
+  if (!nodes || nodes.length === 0) {
+    panel.innerHTML = '<div class="empty"><div class="empty-icon">~</div>Waiting for nodes to connect...</div>';
+    return;
+  }
+  let html = '<table><tr><th>Node ID</th><th>Device</th><th>Layers</th><th>Location</th><th>Sessions</th><th>Status</th></tr>';
+  for (const n of nodes) {
+    const layers = n.layers && n.layers.length === 2 ? n.layers[0] + ' - ' + n.layers[1] : '--';
+    const loc = [n.city, n.country].filter(Boolean).join(', ') || '--';
+    html += '<tr>';
+    html += '<td><span class="node-id">' + esc(n.node_id) + '</span></td>';
+    html += '<td><span class="device-tag ' + deviceClass(n.device) + '">' + esc(n.device) + '</span></td>';
+    html += '<td class="mono" style="font-size:12px;color:var(--text-2)">' + esc(layers) + '</td>';
+    html += '<td style="color:var(--text-2)">' + esc(loc) + '</td>';
+    html += '<td class="mono" style="font-size:12px">' + n.active_sessions + '</td>';
+    html += '<td><span class="badge ' + badgeClass(n.status) + '">' + esc(n.status) + '</span></td>';
+    html += '</tr>';
+  }
+  html += '</table>';
+  panel.innerHTML = html;
+}
+
+function renderModels(models) {
+  const panel = $('models-panel');
+  if (!models || models.length === 0) {
+    panel.innerHTML = '<div class="empty"><div class="empty-icon">~</div>No models registered</div>';
+    return;
+  }
+  let html = '';
+  for (const m of models) {
+    const pct = m.total_layers > 0 ? Math.round((m.covered_layers / m.total_layers) * 100) : 0;
+    const fillClass = pct >= 100 ? 'full' : pct > 0 ? 'partial' : 'empty';
+    const availBadge = m.available
+      ? '<span class="badge badge-active">ready</span>'
+      : '<span class="badge badge-pending">incomplete</span>';
+    html += '<div class="model-row">';
+    html += '<div class="model-name"><span>' + esc(m.name) + '</span>' + availBadge + '</div>';
+    html += '<div class="coverage-bar-wrap">';
+    html += '<div class="coverage-bar"><div class="coverage-fill ' + fillClass + '" style="width:' + pct + '%"></div></div>';
+    html += '<span class="coverage-label">' + m.covered_layers + '/' + m.total_layers + '</span>';
+    html += '</div></div>';
+  }
+  panel.innerHTML = html;
+}
+
+function renderInfo(data) {
+  const panel = $('info-panel');
+  const merkle = data.merkle_root ? data.merkle_root.substring(0, 16) + '...' : '--';
+  const items = [
+    ['Signal ID', data.signal_id ? data.signal_id.substring(0, 12) + '...' : '--'],
+    ['Merkle Root', merkle],
+    ['Protocol', 'v2'],
+    ['WebSocket', location.hostname + ':8770'],
+    ['HTTP API', location.hostname + ':8771'],
+    ['Status', data.total_nodes > 0 ? 'Routing' : 'Idle'],
+  ];
+  let html = '';
+  for (const [k, v] of items) {
+    html += '<div class="info-row"><span class="info-key">' + k + '</span><span class="info-val">' + esc(String(v)) + '</span></div>';
+  }
+  panel.innerHTML = html;
+}
+
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+let errorCount = 0;
+
+async function poll() {
+  try {
+    const r = await fetch('/status');
+    if (!r.ok) throw new Error('status ' + r.status);
+    const data = await r.json();
+    errorCount = 0;
+    $('live-dot').style.background = 'var(--success)';
+    $('live-dot').style.boxShadow = '0 0 6px rgba(74, 225, 104, 0.4)';
+
+    $('total-nodes').textContent = data.total_nodes;
+    $('active-sessions').textContent = data.active_sessions;
+    const avail = (data.models || []).filter(m => m.available).length;
+    $('models-available').textContent = avail;
+    $('models-sub').textContent = data.models ? data.models.length + ' total' : '';
+    $('nodes-sub').textContent = (data.nodes || []).length + ' registered';
+
+    const up = data.uptime_seconds || 0;
+    $('uptime-value').textContent = formatUptime(up);
+    $('uptime-sub').textContent = 'since start';
+
+    $('node-count-badge').textContent = (data.nodes || []).length;
+    $('signal-id').textContent = data.signal_id ? data.signal_id.substring(0, 10) + '...' : '';
+    $('last-update').textContent = new Date().toLocaleTimeString();
+
+    renderNodes(data.nodes);
+    renderModels(data.models);
+    renderInfo(data);
+  } catch (e) {
+    errorCount++;
+    if (errorCount > 2) {
+      $('live-dot').style.background = 'var(--danger)';
+      $('live-dot').style.boxShadow = '0 0 6px rgba(224, 108, 117, 0.4)';
+    }
+  }
+}
+
+poll();
+setInterval(poll, 5000);
+</script>
+
+</body>
+</html>
