@@ -192,12 +192,16 @@ class ComputeNodeServer:
         if self.legacy_mode:
             await self.load()
 
-        scheme = "wss" if use_tls else "ws"
+        if relay_url.startswith("wss://") or relay_url.startswith("ws://"):
+            uri = relay_url
+        else:
+            scheme = "wss" if use_tls else "ws"
+            uri = f"{scheme}://{relay_url}"
         attempt = 0
         while not self._stop.is_set():
             try:
                 async with ws_connect(
-                    f"{scheme}://{relay_url}",
+                    uri,
                     max_size=10 * 1024 * 1024,
                 ) as ws:
                     self._ws = ws

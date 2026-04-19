@@ -89,10 +89,12 @@ class InferenceClient:
         print(json.dumps(event), flush=True)
 
     async def connect(self) -> None:
-        scheme = "wss" if self.use_tls else "ws"
-        if self.signal_mode:
-            uri = f"{scheme}://{self.relay_host}"
+        if self.relay_host.startswith("wss://") or self.relay_host.startswith("ws://"):
+            uri = self.relay_host
+        elif self.signal_mode:
+            uri = f"wss://{self.relay_host}"
         else:
+            scheme = "wss" if self.use_tls else "ws"
             uri = f"{scheme}://{self.relay_host}:{self.relay_port}"
         self.relay_ws = await websockets.connect(uri, max_size=10 * 1024 * 1024)
         if self.signal_mode:
