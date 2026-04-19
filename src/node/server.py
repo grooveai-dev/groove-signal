@@ -1,15 +1,19 @@
 """Outbound-only Groove compute node.
 
-The node opens ONE persistent websocket to the relay, registers itself, then
-processes inbound ENVELOPEs from the relay (which the relay routes from
-consumers) and replies with ENVELOPEs back. The node never accepts inbound
-connections — solving NAT/CGNAT/firewall topology constraints.
+The node opens ONE persistent websocket to the signal service (or legacy
+relay), registers itself, then processes inbound ENVELOPEs and replies with
+ENVELOPEs back. The node never accepts inbound connections — solving
+NAT/CGNAT/firewall topology constraints.
 
-M2: nodes register with capabilities only; the relay's scheduler assigns a
-layer range via ASSIGN_LAYERS after inspecting the global fleet. The node
-then loads its shard on demand and replies with ASSIGNMENT_ACK. A later
-REBALANCE swaps the shard in place. A legacy mode (--layers on the CLI)
-pre-loads the shard at startup like M1.
+M2: nodes register with capabilities only; the scheduler assigns a layer
+range via ASSIGN_LAYERS after inspecting the global fleet. The node then
+loads its shard on demand and replies with ASSIGNMENT_ACK. A later REBALANCE
+swaps the shard in place. A legacy mode (--layers on the CLI) pre-loads the
+shard at startup like M1.
+
+M3: --signal flag connects to the Groove signal service (e.g.
+signal.groovedev.ai) over TLS. The signal service handles node registration,
+scoring, consumer matching, and envelope routing.
 """
 
 import argparse
@@ -699,7 +703,15 @@ def main() -> None:
         help="Legacy mode override: pre-load this layer range at startup (e.g. 0-15). "
         "If omitted, the node runs in dynamic mode and waits for ASSIGN_LAYERS.",
     )
-    parser.add_argument("--relay", required=True, help="Relay address, format HOST:PORT")
+    conn_group = parser.add_mutually_exclusive_group(required=True)
+    conn_group.add_argument(
+        "--signal",
+        help="Signal service hostname (e.g. signal.groovedev.ai). Uses wss:// automatically.",
+    )
+    conn_group.add_argument(
+        "--relay",
+        help="Legacy relay address, format HOST:PORT (use --signal for production)",
+    )
     parser.add_argument("--device", default="cpu", help="Device to use (cpu, cuda, mps)")
     parser.add_argument("--max-context", type=int, default=4096)
     parser.add_argument("--quantize", action="store_true")
@@ -709,12 +721,19 @@ def main() -> None:
         default="~/.groove/node_key.json",
         help="Path to the persisted node keypair",
     )
-    parser.add_argument("--tls", action="store_true", help="Use wss:// to connect to relay")
+    parser.add_argument("--tls", action="store_true", help="Use wss:// (automatic with --signal)")
     parser.add_argument(
         "--log-level", default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
     )
     args = parser.parse_args()
+
+    if args.signal:
+        connect_url = args.signal
+        use_tls = True
+    else:
+        connect_url = args.relay
+        use_tls = args.tls
 
     logging.basicConfig(
         level=getattr(logging, args.log_level),
@@ -729,6 +748,8 @@ def main() -> None:
     layer_start: int | None = None
     layer_end: int | None = None
 
+    connect_label = f"signal={args.signal}" if args.signal else f"relay={args.relay}"
+
     if legacy_mode:
         if args.model is None:
             parser.error("--model is required when --layers is provided")
@@ -740,13 +761,13 @@ def main() -> None:
                 f"Layer range 0-{layer_end - 1} exceeds model's {total_layers} layers"
             )
         logger.info(
-            "starting compute node (legacy mode) model=%s layers=[%d,%d) device=%s relay=%s",
-            args.model, layer_start, layer_end, args.device, args.relay,
+            "starting compute node (legacy mode) model=%s layers=[%d,%d) device=%s %s",
+            args.model, layer_start, layer_end, args.device, connect_label,
         )
     else:
         logger.info(
-            "starting compute node (dynamic mode) device=%s relay=%s",
-            args.device, args.relay,
+            "starting compute node (dynamic mode) device=%s %s",
+            args.device, connect_label,
         )
 
     server = ComputeNodeServer(
@@ -768,7 +789,7 @@ def main() -> None:
                 loop.add_signal_handler(sig, server.request_stop)
             except NotImplementedError:
                 pass
-        await server.run(args.relay, use_tls=args.tls)
+        await server.run(connect_url, use_tls=use_tls)
 
     asyncio.run(_run())
 

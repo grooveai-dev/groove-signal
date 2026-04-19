@@ -1,10 +1,14 @@
 """Groove Decentralized Inference - Consumer Client.
 
-The consumer holds a single websocket to the relay. All work is sent in
-ENVELOPEs addressed by stream_id (returned in PIPELINE_CONFIG) and
-target_node_id (the node the consumer wants to reach). Responses come back
-via the same socket — a single receive task fans them out to per-seq_pos
-futures. The consumer never learns or contacts a node directly.
+The consumer holds a single websocket to the signal service (or legacy
+relay). All work is sent in ENVELOPEs addressed by stream_id (returned in
+PIPELINE_CONFIG) and target_node_id (the node the consumer wants to reach).
+Responses come back via the same socket — a single receive task fans them
+out to per-seq_pos futures. The consumer never learns or contacts a node
+directly.
+
+M3: --signal flag connects to the Groove signal service over TLS. The signal
+service scores and matches nodes, then brokers the connection.
 """
 
 import argparse
@@ -59,10 +63,12 @@ class InferenceClient:
         relay_port: int = 8770,
         json_mode: bool = False,
         use_tls: bool = False,
+        signal_mode: bool = False,
     ):
         self.relay_host = relay_host
         self.relay_port = relay_port
         self.use_tls = use_tls
+        self.signal_mode = signal_mode
         self.relay_ws = None
         self.session_id: Optional[str] = None
         self.stream_id: Optional[str] = None
@@ -84,8 +90,16 @@ class InferenceClient:
 
     async def connect(self) -> None:
         scheme = "wss" if self.use_tls else "ws"
-        uri = f"{scheme}://{self.relay_host}:{self.relay_port}"
+        if self.signal_mode:
+            uri = f"{scheme}://{self.relay_host}"
+        else:
+            uri = f"{scheme}://{self.relay_host}:{self.relay_port}"
         self.relay_ws = await websockets.connect(uri, max_size=10 * 1024 * 1024)
+        if self.signal_mode:
+            self.emit_event({
+                "type": "signal_connected",
+                "signal": self.relay_host,
+            })
 
     async def start_session(
         self, model_name: str, config: Optional[dict] = None
@@ -123,9 +137,25 @@ class InferenceClient:
         if not self.stream_id:
             raise RuntimeError("Relay did not return a stream_id in PIPELINE_CONFIG")
 
+        if self.signal_mode:
+            self.emit_event({
+                "type": "matched",
+                "nodes": [
+                    {
+                        "node_id": n["node_id"],
+                        "score": n.get("score"),
+                        "device": n.get("device"),
+                        "layers": [n.get("layer_start"), n.get("layer_end")],
+                    }
+                    for n in self.pipeline
+                ],
+            })
         self.emit_event({
             "type": "connected",
-            "relay": f"{self.relay_host}:{self.relay_port}",
+            "signal" if self.signal_mode else "relay": (
+                self.relay_host if self.signal_mode
+                else f"{self.relay_host}:{self.relay_port}"
+            ),
             "session_id": self.session_id,
         })
         self.emit_event({
@@ -371,8 +401,14 @@ async def main() -> None:
     parser = argparse.ArgumentParser(
         description="Groove Decentralized Inference Client"
     )
-    parser.add_argument(
-        "--relay", type=str, default="localhost:8770", help="Relay host:port"
+    conn_group = parser.add_mutually_exclusive_group(required=True)
+    conn_group.add_argument(
+        "--signal", type=str,
+        help="Signal service hostname (e.g. signal.groovedev.ai). Uses wss:// automatically.",
+    )
+    conn_group.add_argument(
+        "--relay", type=str,
+        help="Legacy relay host:port (use --signal for production)",
     )
     parser.add_argument(
         "--model", type=str, default="Qwen/Qwen2.5-7B", help="Model name"
@@ -386,13 +422,22 @@ async def main() -> None:
         "--json", action="store_true",
         help="Emit structured JSON events (one per line) on stdout",
     )
-    parser.add_argument("--tls", action="store_true", help="Use wss:// to connect to relay")
+    parser.add_argument("--tls", action="store_true", help="Use wss:// (automatic with --signal)")
     args = parser.parse_args()
 
-    host, port = args.relay.rsplit(":", 1)
+    if args.signal:
+        host = args.signal
+        port = 443
+        use_tls = True
+        signal_mode = True
+    else:
+        host, port_str = args.relay.rsplit(":", 1)
+        port = int(port_str)
+        use_tls = args.tls
+        signal_mode = False
     client = InferenceClient(
-        relay_host=host, relay_port=int(port), json_mode=args.json,
-        use_tls=args.tls,
+        relay_host=host, relay_port=port, json_mode=args.json,
+        use_tls=use_tls, signal_mode=signal_mode,
     )
 
     logging.basicConfig(
@@ -403,18 +448,20 @@ async def main() -> None:
 
     start_ms = time.time() * 1000.0
 
+    connect_label = f"signal={args.signal}" if args.signal else f"relay={args.relay}"
+
     try:
         try:
             await client.connect()
         except (OSError, websockets.WebSocketException) as e:
             client.emit_event({
                 "type": "error",
-                "message": f"Failed to connect to relay: {e}",
+                "message": f"Failed to connect to {connect_label}: {e}",
                 "code": "CONNECTION_FAILED",
             })
             logger.error("connect failed: %s", e)
             sys.exit(1)
-        logger.info("connected to relay at %s (protocol v%d)", args.relay, PROTOCOL_VERSION)
+        logger.info("connected to %s (protocol v%d)", connect_label, PROTOCOL_VERSION)
 
         session_id = await client.start_session(args.model)
         logger.info(

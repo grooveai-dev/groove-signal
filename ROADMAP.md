@@ -732,10 +732,29 @@ Cross-team communication via ~/Desktop/groove-comms/.
 | M1 — Relay data plane | **Complete** | Tested with Qwen2.5-0.5B, multi-node verified |
 | M2 — Dynamic layers | **Complete** | Scheduler, identity, rebalancing, envelope metering |
 | Dashboard integration | **In progress** | Beta install flow, node operator UI, network status |
-| M3 — Decentralized signaling | Not started | Next — embedded relay, signaling service, gaussian scoring |
+| M3 — Decentralized signaling | **In progress** | Signal service built + deployed to signal.groovedev.ai |
 | M4 — Token economics | Not started | $GROOVE on Base L2, three-tier staking, requires M3 |
 | M5 — Savant pre-training | Not started | Data pipeline + 7B/13B/70B models, requires M4 |
 | M6 — Production hardening | Ongoing | Security fixes in progress, batching + quant for M3+ |
+
+**M3 progress (as of 2026-04-19):**
+- [x] Step 2 — Signal service built and deployed (grooveai-dev/groove-signal v0.1.0)
+  - Server (1164 lines): WebSocket + HTTP, rate limiting, TLS support
+  - Gaussian decay scoring (326 lines): haversine, proximity, uptime, compute, load
+  - Node registry (210 lines): Merkle root commitments (SHA256 binary tree)
+  - Consumer matcher (140 lines): pipeline assembly with scoring
+  - Scheduler (201 lines): portable from groove-network
+  - Dockerfile, 58 tests passing
+  - Deployed to signal.groovedev.ai (WebSocket 8770, HTTP 8771 via nginx)
+- [x] --signal flag wired up in node server.py and consumer client.py
+  - Mutually exclusive with --relay (legacy), auto-enables TLS
+  - Consumer emits signal_connected and matched JSON events
+- [ ] Step 1 — Embedded relay + localhost binding (node embeds relay logic)
+- [ ] Step 3 — Multi-signal consensus
+- [ ] Step 4 — Signal gossip + node registry sync
+- [ ] Step 5 — Decentralized scheduling via signals
+- [ ] Step 6 — Geographic clustering + latency optimization
+- [ ] Step 7 — Permissionless signal entry
 
 ---
 
@@ -776,24 +795,26 @@ model smarter than a 400B generic model on Groove-relevant tasks.
 
 ---
 
-## Codebase Structure (post-M2)
+## Codebase Structure (post-M3 signal service)
+
+Three repos under grooveai-dev:
 
 ```
-groove-deploy/  (github.com/grooveai-dev/groove-network)
+groove-network/  (github.com/grooveai-dev/groove-network)
   src/
     common/
-      protocol.py          — message types, msgpack, envelope counter
+      protocol.py          — message types, msgpack, envelope counter, M3 signal types
       tensor_transfer.py   — binary tensor serialization
     relay/
       relay.py             — relay router, dynamic assignment, metering, HTTP /status
       scheduler.py         — portable layer scheduler (no async deps)
     node/
-      server.py            — compute node, on-demand shard loading
+      server.py            — compute node, --signal flag, on-demand shard loading
       shard_loader.py      — HuggingFace model shard loading
       kv_cache.py          — per-session KV cache management
       identity.py          — secp256k1 keypair, Ethereum addresses
     consumer/
-      client.py            — inference client, pipeline walker, --json output
+      client.py            — inference client, --signal flag, --json output
       speculative.py       — speculative decoding
       draft_model.py       — local draft model for speculation
   tests/
@@ -812,6 +833,27 @@ groove-deploy/  (github.com/grooveai-dev/groove-network)
   setup.sh                 — install script (supports --json for daemon integration)
   ROADMAP.md
   QUICKSTART.md
+
+groove-signal/  (github.com/grooveai-dev/groove-signal, deployed to signal.groovedev.ai)
+  src/
+    signal/
+      server.py            — WebSocket + HTTP signal server (1164 lines)
+      scoring.py           — gaussian decay scoring, haversine, IP geolocation
+      registry.py          — node registry with Merkle root commitments
+      matcher.py           — consumer matcher, pipeline assembly
+    common/
+      protocol.py          — shared protocol (copy from groove-network)
+    relay/
+      scheduler.py         — portable scheduler (copy from groove-network)
+  tests/                   — 58 tests
+  Dockerfile               — python:3.12-slim, ports 8770+8771
+  requirements.txt
+  setup.sh
+  README.md
+
+groove/  (github.com/grooveai-dev/groove — Electron desktop app, separate team)
+  — Beta invite code flow, network view, node toggle, consumer chat
+  — Communicates via ~/Desktop/groove-comms/
 ```
 
 ---
@@ -867,18 +909,23 @@ When starting a new session on this project:
 
 1. Read this ROADMAP.md to understand the full vision and current status
 2. Check the Current Status table above for what's done vs. what's next
-3. The codebase is at ~/Desktop/groove-deploy/ (Python, asyncio, websockets)
-4. The Groove dashboard is at ~/Desktop/groove/ (separate repo, separate team)
-5. Cross-team communication: ~/Desktop/groove-comms/ (requests + responses)
-6. GitHub repo: github.com/grooveai-dev/groove-network (public)
-7. Three-tier model: Consumer (pays) / Node (compute) / Signal (routing + compute)
-8. Nodes bind to 127.0.0.1 ONLY — never 0.0.0.0. Security by default.
-9. Signal operators are the only public-facing infrastructure
-10. Node IDs are Ethereum addresses (secp256k1) — they map to Base L2 wallets
-11. The scheduler in src/relay/scheduler.py is portable — moves into signal layer
-12. Envelope counter is already in the wire format — M4 billing reads it
-13. Network is optimized for Savant models (7B-70B), not giant 400B+ models
-14. The competitive advantage is DATA (Groove usage), not model size
-15. Gaussian decay scoring for node selection: proximity, uptime, compute, load
-16. Multi-signal consensus prevents routing manipulation (Bitcoin-inspired)
-17. All tests: `pytest tests/ -v` from the groove-deploy root
+3. Three repos under grooveai-dev:
+   - groove-network (~/Desktop/groove-deploy/) — node + consumer + relay (Python)
+   - groove-signal (~/Desktop/groove-deploy/default/groove-signal/) — signal service (Python)
+   - groove (~/Desktop/groove/) — Electron desktop app (separate team)
+4. Cross-team communication: ~/Desktop/groove-comms/ (requests + responses)
+5. Signal service LIVE at signal.groovedev.ai (WebSocket 8770, HTTP 8771 via nginx)
+6. Three-tier model: Consumer (pays) / Node (compute) / Signal (routing + compute)
+7. Nodes bind to 127.0.0.1 ONLY — never 0.0.0.0. Security by default.
+8. Node/consumer use --signal flag for production (e.g. --signal signal.groovedev.ai)
+9. --relay flag preserved for legacy/local dev
+10. Signal operators are the only public-facing infrastructure
+11. Node IDs are Ethereum addresses (secp256k1) — they map to Base L2 wallets
+12. The scheduler in src/relay/scheduler.py is portable — already copied into signal
+13. Envelope counter is already in the wire format — M4 billing reads it
+14. Network is optimized for Savant models (7B-70B), not giant 400B+ models
+15. The competitive advantage is DATA (Groove usage), not model size
+16. Gaussian decay scoring for node selection: proximity, uptime, compute, load
+17. Multi-signal consensus prevents routing manipulation (Bitcoin-inspired)
+18. All tests (groove-network): `pytest tests/ -v` from groove-deploy root
+19. All tests (groove-signal): `pytest tests/ -v` from groove-signal root
