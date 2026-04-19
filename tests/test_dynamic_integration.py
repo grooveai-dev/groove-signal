@@ -49,7 +49,7 @@ async def _recv(ws) -> dict:
 @pytest.mark.asyncio
 async def test_dynamic_single_node_end_to_end():
     port = _free_port()
-    relay = RelayNode(host="127.0.0.1", port=port)
+    relay = RelayNode(host="127.0.0.1", port=port, require_auth=False)
     server_task = asyncio.create_task(relay.start())
     try:
         await asyncio.sleep(0.15)
@@ -113,7 +113,7 @@ async def test_dynamic_single_node_end_to_end():
 async def test_dynamic_two_nodes_trigger_rebalance():
     """Second node joining causes a REBALANCE to the first node."""
     port = _free_port()
-    relay = RelayNode(host="127.0.0.1", port=port)
+    relay = RelayNode(host="127.0.0.1", port=port, require_auth=False)
     server_task = asyncio.create_task(relay.start())
     try:
         await asyncio.sleep(0.15)

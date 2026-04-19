@@ -34,12 +34,22 @@ REBALANCE = "rebalance"
 AUTH_CHALLENGE = "auth_challenge"
 AUTH_RESPONSE = "auth_response"
 
+# M3 signal-specific message types.
+SIGNAL_REGISTER = "signal_register"
+SIGNAL_ACK = "signal_ack"
+SIGNAL_HEARTBEAT = "signal_heartbeat"
+SIGNAL_QUERY = "signal_query"
+SIGNAL_MATCH = "signal_match"
+SIGNAL_DEREGISTER = "signal_deregister"
+
 ALL_MESSAGE_TYPES = frozenset({
     SESSION_INIT, ACTIVATIONS, LOGITS, SPEC_WINDOW,
     VERIFY_RESULT, HEARTBEAT, PIPELINE_CONFIG, ERROR,
     REGISTER_NODE, REGISTER_ACK, DEREGISTER, ENVELOPE,
     ASSIGN_LAYERS, ASSIGNMENT_ACK, REBALANCE,
     AUTH_CHALLENGE, AUTH_RESPONSE,
+    SIGNAL_REGISTER, SIGNAL_ACK, SIGNAL_HEARTBEAT,
+    SIGNAL_QUERY, SIGNAL_MATCH, SIGNAL_DEREGISTER,
 })
 
 # Default capability fields (M2). Nodes may report a subset; missing keys
@@ -423,4 +433,116 @@ def make_auth_response(
         "node_id": node_id,
         "signature": signature,
         "public_key": public_key,
+    }
+
+
+# ---------------------------------------------------------------------------
+# M3 signal-specific factory functions.
+# ---------------------------------------------------------------------------
+def _normalize_location(location: dict | None) -> dict | None:
+    """Keep only whitelisted location fields."""
+    if not location:
+        return None
+    allowed = {"lat", "lon", "city", "region", "country"}
+    return {k: v for k, v in location.items() if k in allowed}
+
+
+def make_signal_register(
+    node_id: str,
+    capabilities: dict | None = None,
+    location: dict | None = None,
+    models_supported: list[str] | None = None,
+    public_key: str | None = None,
+    protocol_version: int = PROTOCOL_VERSION,
+) -> dict:
+    msg = {
+        "type": SIGNAL_REGISTER,
+        "protocol_version": protocol_version,
+        "node_id": node_id,
+        "capabilities": normalize_capabilities(capabilities),
+        "location": _normalize_location(location),
+        "models_supported": list(models_supported or []),
+    }
+    if public_key is not None:
+        msg["public_key"] = public_key
+    return msg
+
+
+def make_signal_ack(
+    node_id: str,
+    accepted: bool,
+    signal_id: str,
+    message: str = "",
+) -> dict:
+    return {
+        "type": SIGNAL_ACK,
+        "node_id": node_id,
+        "accepted": bool(accepted),
+        "signal_id": signal_id,
+        "message": message,
+    }
+
+
+def make_signal_heartbeat(
+    node_id: str,
+    timestamp: float | None = None,
+    status: str = "alive",
+    capabilities: dict | None = None,
+    active_sessions: int = 0,
+    load: float = 0.0,
+) -> dict:
+    msg = {
+        "type": SIGNAL_HEARTBEAT,
+        "node_id": node_id,
+        "timestamp": timestamp if timestamp is not None else time.time(),
+        "status": status,
+        "active_sessions": int(active_sessions),
+        "load": float(load),
+    }
+    if capabilities is not None:
+        msg["capabilities"] = normalize_capabilities(capabilities)
+    return msg
+
+
+def make_signal_query(
+    session_id: str,
+    model_name: str,
+    consumer_location: dict | None = None,
+    requirements: dict | None = None,
+    top_n: int = 10,
+    protocol_version: int = PROTOCOL_VERSION,
+) -> dict:
+    return {
+        "type": SIGNAL_QUERY,
+        "protocol_version": protocol_version,
+        "session_id": session_id,
+        "model_name": model_name,
+        "consumer_location": _normalize_location(consumer_location),
+        "requirements": dict(requirements or {}),
+        "top_n": int(top_n),
+    }
+
+
+def make_signal_match(
+    session_id: str,
+    nodes: list[dict],
+    stream_id: str | None = None,
+    protocol_version: int = PROTOCOL_VERSION,
+) -> dict:
+    msg = {
+        "type": SIGNAL_MATCH,
+        "protocol_version": protocol_version,
+        "session_id": session_id,
+        "nodes": nodes,
+    }
+    if stream_id is not None:
+        msg["stream_id"] = stream_id
+    return msg
+
+
+def make_signal_deregister(node_id: str, reason: str = "") -> dict:
+    return {
+        "type": SIGNAL_DEREGISTER,
+        "node_id": node_id,
+        "reason": reason,
     }

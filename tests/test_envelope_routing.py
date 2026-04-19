@@ -42,7 +42,7 @@ async def _recv(ws) -> dict:
 @pytest.mark.asyncio
 async def test_envelope_round_trip():
     port = _free_port()
-    relay = RelayNode(host="127.0.0.1", port=port)
+    relay = RelayNode(host="127.0.0.1", port=port, require_auth=False)
     server_task = asyncio.create_task(relay.start())
     try:
         await asyncio.sleep(0.15)
