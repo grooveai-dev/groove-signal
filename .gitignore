@@ -1,0 +1,40 @@
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+
+# Secrets / identity
+node_key.json
+.env
+.env.*
+credentials.json
+*.pem
+
+# Model weights (fetched by HF cache at runtime)
+*.pt
+*.bin
+*.safetensors
+*.onnx
+*.ckpt
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# GROOVE agent metadata (not part of shipped package)
+.groove/
+default/
+AGENTS_REGISTRY.md
+GROOVE_DECISIONS.md
+GROOVE_PROJECT_MAP.md
+GROOVE_AGENT_LOGS/
+
+# Build artifacts
+*.zip
