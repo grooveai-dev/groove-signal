@@ -209,6 +209,8 @@ class SignalServer:
         self._connections_per_ip: dict[str, int] = {}
         self._node_streams: dict[str, set[str]] = {}
         self._rate_limiters_per_ip: dict[str, _RateLimiter] = {}
+        self._pending_teardowns: dict[str, asyncio.Task] = {}
+        self.teardown_grace_period: float = 15.0
 
         dashboard_path = Path(__file__).parent / "dashboard.html"
         try:
@@ -265,6 +267,23 @@ class SignalServer:
                 "stream torn down",
                 extra={"stream_id": sid, "reason": "node_gone", "node_id": node_id},
             )
+
+    async def _delayed_stream_teardown(self, node_id: str, delay: float) -> None:
+        try:
+            await asyncio.sleep(delay)
+            record = self.registry.get_node(node_id)
+            if record is not None and record.assignment_status == "active":
+                logger.info(
+                    "node reconnected within grace period, skipping teardown",
+                    extra={"node_id": node_id},
+                )
+                return
+            await self._teardown_streams_using_node(node_id)
+            self._node_streams.pop(node_id, None)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._pending_teardowns.pop(node_id, None)
 
     async def _authenticate_node(
         self, ws: ServerConnection, node_id: str, public_key: str | None,
@@ -351,6 +370,15 @@ class SignalServer:
         # Always derive location from IP, never trust self-reported.
         ip = ws.remote_address[0] if ws.remote_address else ""
         location = estimate_location_from_ip(ip)
+
+        # Cancel any pending delayed teardown for this node.
+        pending = self._pending_teardowns.pop(node_id, None)
+        if pending is not None:
+            pending.cancel()
+            logger.info(
+                "cancelled pending teardown — node reconnected",
+                extra={"node_id": node_id},
+            )
 
         # Pre-existing record: preserve assignment state, then close stale socket.
         existing = self.registry.get_node(node_id)
@@ -494,14 +522,36 @@ class SignalServer:
         finally:
             current = self.registry.get_node(node_id)
             if current is record:
+                # Node did NOT reconnect yet — deregister immediately so it
+                # isn't matched to new consumers, but give it a grace period
+                # before tearing down existing consumer streams.
                 self.registry.deregister(node_id)
-            self._node_streams.pop(node_id, None)
-            await self._teardown_streams_using_node(node_id)
-            if record.assigned_model:
-                asyncio.create_task(
-                    self._rebalance_after_leave(record.assigned_model),
+                if record.assigned_model:
+                    asyncio.create_task(
+                        self._rebalance_after_leave(record.assigned_model),
+                    )
+                self._pending_teardowns[node_id] = asyncio.create_task(
+                    self._delayed_stream_teardown(
+                        node_id, self.teardown_grace_period,
+                    ),
                 )
-            logger.info("node connection closed", extra={"node_id": node_id})
+                logger.info(
+                    "node connection closed — grace period started",
+                    extra={
+                        "node_id": node_id,
+                        "grace_s": self.teardown_grace_period,
+                    },
+                )
+            else:
+                # Node already reconnected with a fresh websocket — do NOT
+                # tear down consumer streams or trigger rebalance.  The new
+                # connection inherits the assignment and the streams remain
+                # valid because _consumer_envelope_loop resolves the target
+                # via registry.get_node() on every envelope.
+                logger.info(
+                    "stale node connection closed (node already reconnected)",
+                    extra={"node_id": node_id},
+                )
 
     async def _forward_envelope_from_node(
         self, record: NodeRecord, msg: dict,
@@ -822,6 +872,48 @@ class SignalServer:
                 "no suitable pipeline available",
             )
             return
+
+        # Verify every pipeline node still has a live websocket before
+        # committing the consumer to this pipeline.  A node may show as
+        # "active" in the registry while its socket is already dead (e.g.
+        # nginx dropped the connection between heartbeats).
+        for pn in pipeline_nodes:
+            nid = pn["node_id"]
+            record = self.registry.get_node(nid)
+            if record is None or record.assignment_status != "active":
+                await self._send_error(
+                    ws, session_id, "NO_NODES",
+                    f"pipeline node {nid} is no longer available",
+                )
+                return
+            # Probe the websocket — if the underlying transport is closed
+            # the state will reflect it even before the next recv() fires.
+            try:
+                if record.ws.state.name != "OPEN":
+                    logger.warning(
+                        "pipeline node ws not OPEN, evicting",
+                        extra={"node_id": nid, "ws_state": record.ws.state.name},
+                    )
+                    self.registry.deregister(nid)
+                    await self._send_error(
+                        ws, session_id, "NO_NODES",
+                        f"pipeline node {nid} connection is stale",
+                    )
+                    return
+            except Exception:
+                pass  # If we can't check state, proceed optimistically.
+
+            if (time.time() - record.last_heartbeat) > 30.0:
+                logger.warning(
+                    "pipeline node has stale heartbeat, evicting",
+                    extra={"node_id": nid, "age_s": round(time.time() - record.last_heartbeat, 1)},
+                )
+                self.registry.deregister(nid)
+                await self._send_error(
+                    ws, session_id, "NO_NODES",
+                    f"pipeline node {nid} has stale heartbeat",
+                )
+                return
 
         stream_id = uuid.uuid4().hex
         nodes_payload = [
@@ -1182,7 +1274,12 @@ class SignalServer:
                     await record.ws.close()
                 except (ConnectionClosed, OSError):
                     pass
-                await self._teardown_streams_using_node(nid)
+                if nid not in self._pending_teardowns:
+                    self._pending_teardowns[nid] = asyncio.create_task(
+                        self._delayed_stream_teardown(
+                            nid, self.teardown_grace_period,
+                        ),
+                    )
             await asyncio.sleep(5.0)
 
     async def monitor_idle_sessions(self) -> None:
@@ -1240,8 +1337,8 @@ class SignalServer:
             self.port,
             max_size=self.max_message_size,
             ssl=ssl_ctx,
-            ping_interval=30,
-            ping_timeout=10,
+            ping_interval=20,
+            ping_timeout=20,
         ), http_server:
             ws_scheme = "wss" if ssl_ctx else "ws"
             logger.info(
