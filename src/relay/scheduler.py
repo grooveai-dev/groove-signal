@@ -17,9 +17,17 @@ MODEL_REGISTRY: dict[str, dict] = {
     "google/gemma-3-4b": {
         "total_layers": 34,
         "hidden_size": 2560,
-        "num_heads": 32,
+        "num_heads": 8,
         "vocab_size": 262144,
         "memory_per_layer_mb": 120,
+        "dtype": "bfloat16",
+    },
+    "Qwen/Qwen2.5-0.5B": {
+        "total_layers": 24,
+        "hidden_size": 896,
+        "num_heads": 14,
+        "vocab_size": 151936,
+        "memory_per_layer_mb": 50,
         "dtype": "float16",
     },
 }

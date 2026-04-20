@@ -31,6 +31,9 @@ ALLOWED_MODELS = frozenset({
     "meta-llama/Meta-Llama-3.1-8B",
     "meta-llama/Meta-Llama-3.1-70B",
     "google/gemma-3-4b",
+    "google/gemma-2-2b",
+    "google/gemma-2-9b",
+    "google/gemma-2-27b",
 })
 
 
