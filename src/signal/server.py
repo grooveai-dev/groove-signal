@@ -164,7 +164,7 @@ class _RateLimiter:
 # SignalServer
 # ---------------------------------------------------------------------------
 class SignalServer:
-    ASSIGNMENT_TIMEOUT_S = 120.0
+    ASSIGNMENT_TIMEOUT_S = 600.0
 
     def __init__(
         self,
