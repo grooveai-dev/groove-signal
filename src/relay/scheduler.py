@@ -14,12 +14,12 @@ from __future__ import annotations
 # Static model registry. Eventually this will be loaded from disk or fetched
 # from the network; for now, hard-coded entries are sufficient for M2.
 MODEL_REGISTRY: dict[str, dict] = {
-    "google/gemma-3-4b-pt": {
-        "total_layers": 34,
+    "Qwen/Qwen3-4B": {
+        "total_layers": 36,
         "hidden_size": 2560,
-        "num_heads": 8,
-        "vocab_size": 262144,
-        "memory_per_layer_mb": 120,
+        "num_heads": 32,
+        "vocab_size": 151936,
+        "memory_per_layer_mb": 110,
         "dtype": "bfloat16",
     },
     "Qwen/Qwen2.5-0.5B": {
