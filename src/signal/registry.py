@@ -72,6 +72,8 @@ class NodeRegistry:
     one-line fix, so we leave it explicit.
     """
 
+    MAX_DOWNTIME_HISTORY = 100_000
+
     def __init__(self) -> None:
         self.nodes: dict[str, NodeRecord] = {}
         self._downtime_history: dict[str, int] = {}
@@ -113,6 +115,9 @@ class NodeRegistry:
         if record is not None:
             record.downtime_events += 1
             self._downtime_history[node_id] = record.downtime_events
+            if len(self._downtime_history) > self.MAX_DOWNTIME_HISTORY:
+                oldest = next(iter(self._downtime_history))
+                del self._downtime_history[oldest]
         return record
 
     # ---- heartbeats ----------------------------------------------------
@@ -131,9 +136,18 @@ class NodeRegistry:
         if capabilities is not None:
             record.capabilities = dict(capabilities)
         if active_sessions is not None:
-            record.active_sessions = int(active_sessions)
+            try:
+                record.active_sessions = max(0, min(int(active_sessions), 10_000))
+            except (TypeError, ValueError):
+                pass
         if load is not None:
-            record.load = float(load)
+            try:
+                v = float(load)
+                import math
+                if not (math.isnan(v) or math.isinf(v)):
+                    record.load = max(0.0, min(v, 1000.0))
+            except (TypeError, ValueError):
+                pass
         # status is accepted but not currently surfaced — future hook for
         # 'draining', 'maintenance', etc.
         _ = status
@@ -204,7 +218,7 @@ class NodeRegistry:
                 if i + 1 < len(leaves):
                     combined = leaves[i] + leaves[i + 1]
                 else:
-                    combined = leaves[i]
+                    combined = leaves[i] + leaves[i]
                 nxt.append(hashlib.sha256(combined).digest())
             leaves = nxt
         return leaves[0].hex()

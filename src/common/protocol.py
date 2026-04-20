@@ -14,6 +14,7 @@ role introduced in M3.
 
 from __future__ import annotations
 
+import re
 import struct
 import time
 import uuid
@@ -81,18 +82,38 @@ CAPABILITY_KEYS = frozenset(CAPABILITY_DEFAULTS.keys()) | frozenset({
     "layer_start", "layer_end", "load",
 })
 
+NODE_ID_RE = re.compile(r'^0x[0-9a-fA-F]{40}$')
+
+def validate_node_id(node_id: str) -> bool:
+    return bool(node_id and NODE_ID_RE.match(node_id))
+
 
 def normalize_capabilities(caps: dict | None) -> dict:
     """Return a dict with all M2 capability fields populated.
 
-    Only whitelisted keys are preserved to prevent injection of unexpected
-    fields from untrusted input.
+    Only whitelisted keys are preserved to prevent injection of
+    unexpected fields from untrusted input. Numeric fields are
+    coerced and clamped; non-finite values are rejected.
     """
+    import math
     out = dict(CAPABILITY_DEFAULTS)
     if caps:
         for k, v in caps.items():
             if k in CAPABILITY_KEYS:
                 out[k] = v
+    for k in ("ram_mb", "vram_mb", "bandwidth_mbps", "cpu_cores", "max_context_length"):
+        try:
+            v = float(out[k])
+            if math.isnan(v) or math.isinf(v) or v < 0:
+                out[k] = CAPABILITY_DEFAULTS.get(k, 0)
+            else:
+                out[k] = v
+        except (TypeError, ValueError):
+            out[k] = CAPABILITY_DEFAULTS.get(k, 0)
+    if not isinstance(out.get("device"), str):
+        out["device"] = "cpu"
+    if not isinstance(out.get("gpu_model"), str):
+        out["gpu_model"] = ""
     return out
 
 
@@ -122,7 +143,13 @@ def unpack_tensor_header(blob: bytes) -> tuple[tuple, str, bytes]:
     offset = 0
     (shape_len,) = struct.unpack_from(SHAPE_LEN_FMT, blob, offset)
     offset += struct.calcsize(SHAPE_LEN_FMT)
-    shape = tuple(msgpack.unpackb(blob[offset : offset + shape_len]))
+    shape = tuple(msgpack.unpackb(
+        blob[offset : offset + shape_len],
+        max_array_len=100,
+        max_map_len=10,
+        max_str_len=256,
+        max_bin_len=256,
+    ))
     offset += shape_len
     (dtype_str_len,) = struct.unpack_from(DTYPE_STR_LEN_FMT, blob, offset)
     offset += struct.calcsize(DTYPE_STR_LEN_FMT)

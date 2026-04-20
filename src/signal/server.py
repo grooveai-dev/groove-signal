@@ -352,9 +352,18 @@ class SignalServer:
         ip = ws.remote_address[0] if ws.remote_address else ""
         location = estimate_location_from_ip(ip)
 
-        # Pre-existing record: close the stale socket before replacing.
+        # Pre-existing record: preserve assignment state, then close stale socket.
         existing = self.registry.get_node(node_id)
+        prev_assignment = None
         if existing is not None:
+            if (existing.assignment_status == "active"
+                    and existing.assigned_model
+                    and existing.layer_start is not None):
+                prev_assignment = {
+                    "model": existing.assigned_model,
+                    "layer_start": existing.layer_start,
+                    "layer_end": existing.layer_end,
+                }
             try:
                 await existing.ws.close()
             except (ConnectionClosed, OSError):
@@ -383,6 +392,26 @@ class SignalServer:
             if loaded:
                 record.assigned_model = loaded[0]
             ack = make_register_ack(node_id, True, "ok")
+        elif prev_assignment is not None:
+            record.assigned_model = prev_assignment["model"]
+            record.layer_start = prev_assignment["layer_start"]
+            record.layer_end = prev_assignment["layer_end"]
+            record.assignment_status = "active"
+            if msg_type == SIGNAL_REGISTER:
+                ack = make_signal_ack(
+                    node_id, True, self.signal_id,
+                    "reconnected; restored assignment",
+                )
+            else:
+                ack = make_register_ack(node_id, True, "reconnected; restored assignment")
+            logger.info(
+                "restored previous assignment on reconnect",
+                extra={
+                    "node_id": node_id,
+                    "model": prev_assignment["model"],
+                    "layers": [prev_assignment["layer_start"], prev_assignment["layer_end"]],
+                },
+            )
         elif msg_type == SIGNAL_REGISTER:
             ack = make_signal_ack(
                 node_id, True, self.signal_id,
@@ -407,7 +436,7 @@ class SignalServer:
             },
         )
 
-        if not is_legacy_static:
+        if not is_legacy_static and prev_assignment is None:
             asyncio.create_task(self._dynamic_assign(record))
 
         await self._node_message_loop(ws, record)
@@ -529,6 +558,14 @@ class SignalServer:
         kind: str,
         reason: str = "",
     ) -> dict | None:
+        live = self.registry.get_node(record.node_id)
+        if live is not record:
+            logger.info(
+                "skipping assignment to stale record",
+                extra={"node_id": record.node_id, "kind": kind},
+            )
+            return None
+
         try:
             info = get_model_info(model_name)
         except ValueError:
@@ -599,12 +636,21 @@ class SignalServer:
         return ""
 
     async def _dynamic_assign(self, record: NodeRecord) -> None:
+        node_id = record.node_id
         async with self._sched_lock:
+            live = self.registry.get_node(node_id)
+            if live is None or live is not record:
+                logger.info(
+                    "node reconnected before assignment; skipping stale assign",
+                    extra={"node_id": node_id},
+                )
+                return
+
             model_name = self._pick_model_for_new_node(record)
             if not model_name:
                 logger.warning(
                     "no model in registry; cannot assign",
-                    extra={"node_id": record.node_id},
+                    extra={"node_id": node_id},
                 )
                 return
 
@@ -615,7 +661,7 @@ class SignalServer:
                 if nid in self.registry.nodes
             ]
             all_caps.append(
-                {"node_id": record.node_id, **record.capabilities},
+                {"node_id": node_id, **record.capabilities},
             )
             try:
                 new_assignments, affected = calculate_rebalance(
@@ -624,7 +670,7 @@ class SignalServer:
             except ValueError as e:
                 logger.warning(
                     "scheduler refused to assign",
-                    extra={"node_id": record.node_id, "err": str(e)},
+                    extra={"node_id": node_id, "err": str(e)},
                 )
                 return
             await self._apply_assignments(
