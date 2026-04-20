@@ -62,6 +62,8 @@ from src.node.shard_loader import forward_shard, get_model_info, load_model_shar
 
 logger = logging.getLogger("node")
 
+_NODE_START_TIME = time.time()
+
 
 def _capabilities(
     model_name: str | None,
@@ -89,19 +91,48 @@ def _capabilities(
         gpu_model = "Apple Silicon"
 
     try:
+        ram_used_mb = int(psutil.virtual_memory().used / (1024 * 1024))
+        ram_pct = round(psutil.virtual_memory().percent, 1)
+    except Exception:
+        ram_used_mb = 0
+        ram_pct = 0.0
+
+    try:
         load = float(os.getloadavg()[0])
     except (AttributeError, OSError):
         load = 0.0
 
+    gpu_utilization_pct = 0
+    vram_used_mb = 0
+    if torch.cuda.is_available():
+        try:
+            import subprocess
+
+            result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used", "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                parts = result.stdout.strip().split(", ")
+                gpu_utilization_pct = int(parts[0])
+                vram_used_mb = int(parts[1])
+        except Exception:
+            pass
+
     caps = {
         "ram_mb": ram_mb,
+        "ram_used_mb": ram_used_mb,
+        "ram_pct": ram_pct,
         "vram_mb": vram_mb,
+        "vram_used_mb": vram_used_mb,
+        "gpu_utilization_pct": gpu_utilization_pct,
         "load": load,
         "device": device,
         "cpu_cores": os.cpu_count() or 0,
         "gpu_model": gpu_model,
         "max_context_length": max_context,
         "bandwidth_mbps": 0.0,
+        "uptime_seconds": int(time.time() - _NODE_START_TIME),
         "models_loaded": [model_name] if (model_name and loaded_layers) else [],
         "model_preferences": model_preferences or ([model_name] if model_name else []),
         "protocol_version": PROTOCOL_VERSION,
