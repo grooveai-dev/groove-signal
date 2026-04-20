@@ -3,7 +3,7 @@
 Loads a subset of transformer layers from a HuggingFace causal LM,
 enabling layer-wise sharding across multiple compute nodes.
 
-Supported architectures: Llama, Qwen2.5, Gemma (all use model.model.layers).
+Supported architectures: Qwen3, Qwen2.5 (all use model.model.layers).
 """
 
 import logging
@@ -16,6 +16,12 @@ logger = logging.getLogger(__name__)
 
 
 ALLOWED_MODELS = frozenset({
+    "Qwen/Qwen3-0.6B",
+    "Qwen/Qwen3-1.7B",
+    "Qwen/Qwen3-4B",
+    "Qwen/Qwen3-8B",
+    "Qwen/Qwen3-14B",
+    "Qwen/Qwen3-32B",
     "Qwen/Qwen2.5-0.5B",
     "Qwen/Qwen2.5-1.5B",
     "Qwen/Qwen2.5-3B",
@@ -23,17 +29,6 @@ ALLOWED_MODELS = frozenset({
     "Qwen/Qwen2.5-14B",
     "Qwen/Qwen2.5-32B",
     "Qwen/Qwen2.5-72B",
-    "meta-llama/Llama-2-7b-hf",
-    "meta-llama/Llama-2-13b-hf",
-    "meta-llama/Llama-2-70b-hf",
-    "meta-llama/Meta-Llama-3-8B",
-    "meta-llama/Meta-Llama-3-70B",
-    "meta-llama/Meta-Llama-3.1-8B",
-    "meta-llama/Meta-Llama-3.1-70B",
-    "google/gemma-3-4b-pt",
-    "google/gemma-2-2b",
-    "google/gemma-2-9b",
-    "google/gemma-2-27b",
 })
 
 
@@ -175,7 +170,7 @@ def load_model_shard(
 def _get_inner_model(model) -> nn.Module:
     """Navigate the model wrapper to get the inner transformer model.
 
-    Works for Llama, Qwen2.5, Gemma, and similar architectures where
+    Works for Qwen3, Qwen2.5, and similar architectures where
     the structure is model.model.layers.
     """
     if hasattr(model, "model") and hasattr(model.model, "layers"):
