@@ -18,6 +18,7 @@ scoring, consumer matching, and envelope routing.
 
 import argparse
 import asyncio
+import concurrent.futures
 import logging
 import os
 import signal
@@ -163,6 +164,10 @@ class ComputeNodeServer:
         self._stop = asyncio.Event()
         self._ws = None
         self._assignment_lock = asyncio.Lock()
+        self._inference_executor = (
+            concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            if self.device == "mps" else None
+        )
 
     async def load(self) -> None:
         if self.model_name is None or self.layer_start is None or self.layer_end is None:
@@ -599,7 +604,7 @@ class ComputeNodeServer:
 
         loop = asyncio.get_event_loop()
         output, kv_cache = await loop.run_in_executor(
-            None, lambda: forward_shard(self.shard, hidden_states, kv_cache=kv_cache)
+            self._inference_executor, lambda: forward_shard(self.shard, hidden_states, kv_cache=kv_cache)
         )
 
         is_last_shard = self.shard["lm_head"] is not None
@@ -665,7 +670,7 @@ class ComputeNodeServer:
         kv_cache = session_cache.get_cache()
         loop = asyncio.get_event_loop()
         logits, kv_cache = await loop.run_in_executor(
-            None, lambda: forward_shard(self.shard, candidate_tensor, kv_cache=kv_cache)
+            self._inference_executor, lambda: forward_shard(self.shard, candidate_tensor, kv_cache=kv_cache)
         )
 
         accepted_tokens: list[int] = []

@@ -64,6 +64,7 @@ class InferenceClient:
         json_mode: bool = False,
         use_tls: bool = False,
         signal_mode: bool = False,
+        node_timeout: float = 30.0,
     ):
         self.relay_host = relay_host
         self.relay_port = relay_port
@@ -83,6 +84,7 @@ class InferenceClient:
         self.tokens_generated: int = 0
         self._node_gone: bool = False
         self.max_retries: int = 3
+        self.node_timeout: float = node_timeout
 
     def emit_event(self, event: dict) -> None:
         """Print one JSON event line to stdout. No-op when json_mode is off."""
@@ -242,8 +244,10 @@ class InferenceClient:
             self._waiters.clear()
 
     async def _send_to_node(
-        self, node_id: str, inner: dict, timeout: float = 120.0,
+        self, node_id: str, inner: dict, timeout: float | None = None,
     ) -> dict:
+        if timeout is None:
+            timeout = self.node_timeout
         if self.relay_ws is None or self.stream_id is None:
             raise RuntimeError("No active session — call connect()/start_session() first")
         if self._recv_task is not None and self._recv_task.done():
@@ -287,8 +291,8 @@ class InferenceClient:
         ACTIVATIONS that we hand off to the next node; we return the first
         terminal response (LOGITS, VERIFY_RESULT, or ERROR).
 
-        On NODE_GONE, retries by re-establishing the session up to
-        max_retries times.
+        On NODE_GONE or timeout, retries by re-establishing the session
+        up to max_retries times.
         """
         for attempt in range(1, self.max_retries + 1):
             try:
@@ -305,18 +309,21 @@ class InferenceClient:
                     return response
                 return last_response
             except RuntimeError as e:
-                if "NODE_GONE" not in str(e) or not self._node_gone:
+                is_node_gone = self._node_gone
+                is_timeout = "did not respond within" in str(e)
+                if not (is_node_gone or is_timeout):
                     raise
                 if attempt >= self.max_retries:
                     raise
+                reason = "NODE_GONE" if is_node_gone else "TIMEOUT"
                 self.emit_event({
                     "type": "retry",
-                    "reason": "NODE_GONE",
+                    "reason": reason,
                     "attempt": attempt,
                 })
                 logger.warning(
-                    "NODE_GONE — retrying session (%d/%d)",
-                    attempt, self.max_retries,
+                    "%s — retrying session (%d/%d)",
+                    reason, attempt, self.max_retries,
                 )
                 self._node_gone = False
                 model = self.model_name
