@@ -179,16 +179,24 @@ class InferenceClient:
             async for raw in self.relay_ws:
                 if isinstance(raw, str):
                     raw = raw.encode("utf-8")
-                msg = decode_message(raw)
+                try:
+                    msg = decode_message(raw)
+                except Exception:
+                    logger.warning("failed to decode message from relay, skipping")
+                    continue
 
                 if msg["type"] == ENVELOPE:
-                    inner = msgpack.unpackb(
-                        msg["payload"], raw=False,
-                        max_str_len=10 * 1024 * 1024,
-                        max_bin_len=10 * 1024 * 1024,
-                        max_array_len=10_000,
-                        max_map_len=1_000,
-                    )
+                    try:
+                        inner = msgpack.unpackb(
+                            msg["payload"], raw=False,
+                            max_str_len=10 * 1024 * 1024,
+                            max_bin_len=10 * 1024 * 1024,
+                            max_array_len=10_000,
+                            max_map_len=1_000,
+                        )
+                    except Exception:
+                        logger.warning("failed to decode envelope payload, skipping")
+                        continue
                     seq = inner.get("seq_pos")
                     fut = self._waiters.pop(seq, None)
                     if fut is not None and not fut.done():
@@ -203,6 +211,8 @@ class InferenceClient:
                     self._waiters.clear()
         except websockets.ConnectionClosed:
             pass
+        except Exception:
+            logger.exception("receive loop crashed")
         finally:
             err = ConnectionError("Relay connection closed")
             for fut in list(self._waiters.values()):
@@ -210,9 +220,16 @@ class InferenceClient:
                     fut.set_exception(err)
             self._waiters.clear()
 
-    async def _send_to_node(self, node_id: str, inner: dict) -> dict:
+    async def _send_to_node(
+        self, node_id: str, inner: dict, timeout: float = 120.0,
+    ) -> dict:
         if self.relay_ws is None or self.stream_id is None:
             raise RuntimeError("No active session — call connect()/start_session() first")
+        if self._recv_task is not None and self._recv_task.done():
+            exc = self._recv_task.exception() if not self._recv_task.cancelled() else None
+            raise ConnectionError(
+                f"Receive loop died before response: {exc or 'cancelled'}"
+            )
         seq = inner["seq_pos"]
         if seq in self._waiters:
             raise RuntimeError(f"In-flight request already exists for seq_pos={seq}")
@@ -233,7 +250,14 @@ class InferenceClient:
             self._waiters.pop(seq, None)
             raise
 
-        return await fut
+        try:
+            return await asyncio.wait_for(fut, timeout=timeout)
+        except asyncio.TimeoutError:
+            self._waiters.pop(seq, None)
+            raise RuntimeError(
+                f"Pipeline node {node_id[:10]}… did not respond within "
+                f"{timeout}s (seq_pos={seq})"
+            )
 
     async def send_to_pipeline(self, message: dict) -> dict:
         """Forward a message through every node in pipeline order.

@@ -16,6 +16,7 @@ import argparse
 import asyncio
 import json
 import logging
+import re
 import secrets
 import ssl
 import sys
@@ -641,7 +642,8 @@ class RelayNode:
             await self._apply_assignments(model_name, new_assignments, affected, reason="leave")
 
     async def _handle_consumer(self, ws: ServerConnection, first: dict) -> None:
-        session_id = first.get("session_id") or uuid.uuid4().hex
+        raw_sid = first.get("session_id") or ""
+        session_id = raw_sid if re.match(r'^[a-f0-9]{32}$', raw_sid) else uuid.uuid4().hex
         model_name = first.get("model_name", "")
         pv = first.get("protocol_version")
         if pv != PROTOCOL_VERSION:
@@ -740,6 +742,15 @@ class RelayNode:
                     )
                     continue
 
+                count = msg.get("envelope_count", 0)
+                last = ce.last_envelope_count.get(target, -1)
+                if count <= last:
+                    await self._send_error(
+                        ws, session_id, "REPLAY",
+                        "envelope_count not monotonically increasing",
+                    )
+                    continue
+                ce.last_envelope_count[target] = count
                 msg["stream_id"] = stream_id
                 ce.envelope_counts[target] = ce.envelope_counts.get(target, 0) + 1
                 ce.last_activity = time.time()
@@ -984,6 +995,7 @@ class RelayNode:
         ssl_ctx = None
         if self.tls_cert and self.tls_key:
             ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
             ssl_ctx.load_cert_chain(self.tls_cert, self.tls_key)
             logger.info("TLS enabled for WebSocket server")
 
@@ -1005,6 +1017,8 @@ class RelayNode:
             self.port,
             max_size=self.max_message_size,
             ssl=ssl_ctx,
+            ping_interval=30,
+            ping_timeout=10,
         ), http_server:
             ws_scheme = "wss" if ssl_ctx else "ws"
             logger.info("relay listening",
