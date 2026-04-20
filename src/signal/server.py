@@ -710,6 +710,11 @@ class SignalServer:
                 for nid in current
                 if nid in self.registry.nodes
             ]
+            for nid, rec in self.registry.nodes.items():
+                if rec is record or nid in current:
+                    continue
+                if rec.assignment_status in ("loading", "pending"):
+                    all_caps.append({"node_id": nid, **rec.capabilities})
             all_caps.append(
                 {"node_id": node_id, **record.capabilities},
             )
