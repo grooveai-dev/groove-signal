@@ -136,6 +136,13 @@ class ComputeNodeServer:
         self.model_name = model_name
         self.layer_start = layer_start
         self.layer_end = layer_end
+        if device == "auto":
+            if torch.cuda.is_available():
+                device = "cuda"
+            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                device = "mps"
+            else:
+                device = "cpu"
         self.device = device
         self.max_context = max_context
         self.quantize = quantize
