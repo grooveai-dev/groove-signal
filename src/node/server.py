@@ -835,6 +835,21 @@ def main() -> None:
             args.device, connect_label,
         )
 
+    if args.model:
+        from src.node.shard_loader import _validate_model_name
+        _validate_model_name(args.model)
+        try:
+            from huggingface_hub import snapshot_download
+            logger.info("Ensuring model weights are cached for %s...", args.model)
+            snapshot_download(
+                args.model,
+                allow_patterns=["*.safetensors", "*.json"],
+            )
+            logger.info("Model weights ready")
+        except Exception as e:
+            logger.error("Failed to download model weights: %s", e)
+            sys.exit(1)
+
     server = ComputeNodeServer(
         model_name=args.model,
         layer_start=layer_start,
