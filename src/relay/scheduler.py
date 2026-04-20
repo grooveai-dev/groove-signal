@@ -14,7 +14,7 @@ from __future__ import annotations
 # Static model registry. Eventually this will be loaded from disk or fetched
 # from the network; for now, hard-coded entries are sufficient for M2.
 MODEL_REGISTRY: dict[str, dict] = {
-    "google/gemma-3-4b": {
+    "google/gemma-3-4b-pt": {
         "total_layers": 34,
         "hidden_size": 2560,
         "num_heads": 8,
