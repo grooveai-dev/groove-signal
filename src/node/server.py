@@ -365,10 +365,11 @@ class ComputeNodeServer:
 
             try:
                 response = await self._dispatch(inner)
-            except Exception:
+            except Exception as exc:
                 logger.exception("dispatch failed")
                 response = make_error(
-                    inner.get("session_id", ""), 500, "internal processing error",
+                    inner.get("session_id", ""), 500,
+                    f"internal processing error: {type(exc).__name__}: {exc}",
                 )
                 response["seq_pos"] = inner.get("seq_pos")
 
