@@ -1123,14 +1123,22 @@ class SignalServer:
                 active_node_count += 1
             redacted_id = nid[:8] + "..." if len(nid) > 8 else nid
             loc = record.location or {}
+            caps = record.capabilities or {}
             nodes_payload.append({
                 "node_id": redacted_id,
-                "device": (record.capabilities or {}).get("device", "cpu"),
+                "device": caps.get("device", "cpu"),
                 "layers": layers,
                 "status": record.assignment_status,
                 "city": loc.get("city", ""),
                 "country": loc.get("country", ""),
                 "active_sessions": record.active_sessions,
+                "ram_mb": caps.get("ram_mb", 0),
+                "vram_mb": caps.get("vram_mb", 0),
+                "gpu_model": caps.get("gpu_model", ""),
+                "cpu_cores": caps.get("cpu_cores", 0),
+                "bandwidth_mbps": caps.get("bandwidth_mbps", 0.0),
+                "max_context_length": caps.get("max_context_length", 0),
+                "load": record.load if record.load is not None else 0.0,
             })
 
         models_payload = []
@@ -1147,6 +1155,18 @@ class SignalServer:
                 "available": available,
             })
 
+        active_records = [r for r in self.registry.nodes.values() if r.assignment_status == "active"]
+        all_count = len(self.registry.nodes)
+        compute = {
+            "total_ram_mb": sum((r.capabilities or {}).get("ram_mb", 0) for r in active_records),
+            "total_vram_mb": sum((r.capabilities or {}).get("vram_mb", 0) for r in active_records),
+            "total_cpu_cores": sum((r.capabilities or {}).get("cpu_cores", 0) for r in active_records),
+            "total_bandwidth_mbps": sum((r.capabilities or {}).get("bandwidth_mbps", 0.0) for r in active_records),
+            "active_nodes": len(active_records),
+            "total_nodes": all_count,
+            "avg_load": round(sum(r.load or 0.0 for r in active_records) / max(1, len(active_records)), 2),
+        }
+
         return {
             "signal_id": self.signal_id,
             "merkle_root": self.registry.merkle_root(),
@@ -1155,6 +1175,7 @@ class SignalServer:
             "total_nodes": active_node_count,
             "active_sessions": len(self.streams),
             "uptime_seconds": int(time.time() - self.start_time),
+            "compute": compute,
         }
 
     # ---- HTTP ----------------------------------------------------------
