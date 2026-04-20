@@ -197,6 +197,22 @@ class InferenceClient:
                     except Exception:
                         logger.warning("failed to decode envelope payload, skipping")
                         continue
+                    if inner.get("type") == ERROR:
+                        seq = inner.get("seq_pos")
+                        err = RuntimeError(
+                            f"Node error [{inner.get('code')}]: "
+                            f"{inner.get('message', '')}"
+                        )
+                        if seq is not None:
+                            fut = self._waiters.pop(seq, None)
+                            if fut is not None and not fut.done():
+                                fut.set_exception(err)
+                        else:
+                            for fut in list(self._waiters.values()):
+                                if not fut.done():
+                                    fut.set_exception(err)
+                            self._waiters.clear()
+                        continue
                     seq = inner.get("seq_pos")
                     fut = self._waiters.pop(seq, None)
                     if fut is not None and not fut.done():

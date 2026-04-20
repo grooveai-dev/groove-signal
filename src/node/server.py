@@ -370,6 +370,7 @@ class ComputeNodeServer:
                 response = make_error(
                     inner.get("session_id", ""), 500, "internal processing error",
                 )
+                response["seq_pos"] = inner.get("seq_pos")
 
             if response is None:
                 continue
@@ -546,14 +547,18 @@ class ComputeNodeServer:
         if t == HEARTBEAT:
             return self._handle_heartbeat(msg)
         logger.warning("unhandled inner type: %s", t)
-        return make_error(msg.get("session_id", ""), 400, f"Unhandled message type: {t}")
+        err = make_error(msg.get("session_id", ""), 400, f"Unhandled message type: {t}")
+        err["seq_pos"] = msg.get("seq_pos")
+        return err
 
     async def _handle_session_init(self, msg: dict) -> dict:
         if self.shard is None:
-            return make_error(
+            err = make_error(
                 msg.get("session_id", ""), 409,
                 "node has no shard loaded yet — awaiting ASSIGN_LAYERS",
             )
+            err["seq_pos"] = msg.get("seq_pos")
+            return err
         session_id = msg["session_id"]
         num_layers = self.layer_end - self.layer_start
         max_ctx = msg.get("config", {}).get("max_context", self.max_context)
@@ -563,10 +568,12 @@ class ComputeNodeServer:
 
     async def _handle_activations(self, msg: dict) -> dict:
         if self.shard is None:
-            return make_error(
+            err = make_error(
                 msg.get("session_id", ""), 409,
                 "node has no shard loaded",
             )
+            err["seq_pos"] = msg.get("seq_pos")
+            return err
         session_id = msg["session_id"]
         hidden_bytes = msg["hidden_states_bytes"]
         hidden_states = deserialize_tensor(hidden_bytes, device=self.device)
@@ -608,30 +615,38 @@ class ComputeNodeServer:
     @torch.inference_mode()
     async def _handle_spec_window(self, msg: dict) -> dict:
         if self.shard is None:
-            return make_error(
+            err = make_error(
                 msg.get("session_id", ""), 409,
                 "node has no shard loaded",
             )
+            err["seq_pos"] = msg.get("seq_pos")
+            return err
         session_id = msg["session_id"]
         candidate_ids = msg["candidate_ids"]
         num_candidates = len(candidate_ids)
 
         if not self.shard["lm_head"]:
-            return make_error(
+            err = make_error(
                 session_id, 400,
                 "SPEC_WINDOW can only be handled by the final shard (has lm_head)",
             )
+            err["seq_pos"] = msg.get("seq_pos")
+            return err
 
         session_cache = self.kv_manager.get_session(session_id)
         if session_cache is None:
-            return make_error(session_id, 404, f"No session found: {session_id}")
+            err = make_error(session_id, 404, f"No session found: {session_id}")
+            err["seq_pos"] = msg.get("seq_pos")
+            return err
 
         if not self.shard["embed_tokens"]:
-            return make_error(
+            err = make_error(
                 session_id, 400,
                 "SPEC_WINDOW requires the shard to have embed_tokens (first shard) "
                 "or pre-computed hidden states.",
             )
+            err["seq_pos"] = msg.get("seq_pos")
+            return err
 
         candidate_tensor = torch.tensor(
             [candidate_ids], dtype=torch.long, device=self.device
