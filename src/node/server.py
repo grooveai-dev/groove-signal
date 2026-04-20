@@ -210,6 +210,8 @@ class ComputeNodeServer:
                 async with ws_connect(
                     uri,
                     max_size=10 * 1024 * 1024,
+                    ping_interval=20,
+                    ping_timeout=10,
                 ) as ws:
                     self._ws = ws
                     await self._register(ws)

@@ -81,6 +81,8 @@ class InferenceClient:
         self.envelope_count: int = 0
         self.json_mode = json_mode
         self.tokens_generated: int = 0
+        self._node_gone: bool = False
+        self.max_retries: int = 3
 
     def emit_event(self, event: dict) -> None:
         """Print one JSON event line to stdout. No-op when json_mode is off."""
@@ -218,8 +220,11 @@ class InferenceClient:
                     if fut is not None and not fut.done():
                         fut.set_result(inner)
                 elif msg["type"] == ERROR:
+                    code = msg.get("code", "")
+                    if code == "NODE_GONE":
+                        self._node_gone = True
                     err = RuntimeError(
-                        f"Relay error [{msg.get('code')}]: {msg.get('message', '')}"
+                        f"Relay error [{code}]: {msg.get('message', '')}"
                     )
                     for fut in list(self._waiters.values()):
                         if not fut.done():
@@ -281,19 +286,45 @@ class InferenceClient:
         The message flows node-by-node: each non-terminal node returns
         ACTIVATIONS that we hand off to the next node; we return the first
         terminal response (LOGITS, VERIFY_RESULT, or ERROR).
+
+        On NODE_GONE, retries by re-establishing the session up to
+        max_retries times.
         """
-        msg = message
-        last_response: dict = {}
-        for node in self.pipeline:
-            response = await self._send_to_node(node["node_id"], msg)
-            t = response.get("type")
-            if t in (LOGITS, VERIFY_RESULT, ERROR):
-                return response
-            if t == ACTIVATIONS:
-                msg = response
-                continue
-            return response
-        return last_response
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                msg = message
+                last_response: dict = {}
+                for node in self.pipeline:
+                    response = await self._send_to_node(node["node_id"], msg)
+                    t = response.get("type")
+                    if t in (LOGITS, VERIFY_RESULT, ERROR):
+                        return response
+                    if t == ACTIVATIONS:
+                        msg = response
+                        continue
+                    return response
+                return last_response
+            except RuntimeError as e:
+                if "NODE_GONE" not in str(e) or not self._node_gone:
+                    raise
+                if attempt >= self.max_retries:
+                    raise
+                self.emit_event({
+                    "type": "retry",
+                    "reason": "NODE_GONE",
+                    "attempt": attempt,
+                })
+                logger.warning(
+                    "NODE_GONE — retrying session (%d/%d)",
+                    attempt, self.max_retries,
+                )
+                self._node_gone = False
+                model = self.model_name
+                await self.close_session()
+                self._closed = False
+                await self.connect()
+                await self.start_session(model)
+        return {}
 
     async def generate(
         self,
