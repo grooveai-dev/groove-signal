@@ -551,6 +551,8 @@ async def main() -> None:
             code = "NO_NODES"
         elif "lost node" in low or "node_gone" in low or "pipeline" in low:
             code = "PIPELINE_BROKEN"
+        elif "node error" in low or "no shard" in low:
+            code = "NODE_ERROR"
         else:
             code = "SESSION_ERROR"
         client.emit_event({"type": "error", "message": msg, "code": code})
