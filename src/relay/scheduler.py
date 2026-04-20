@@ -93,9 +93,15 @@ def assign_layers(
             "every node at least one layer"
         )
 
-    # Cold start: single node gets all layers regardless of capacity.
     if n == 1:
         nid = nodes[0]["node_id"]
+        capacity = _effective_capacity_mb(nodes[0])
+        model_mem = total_layers * info.get("memory_per_layer_mb", 0)
+        if model_mem > 0 and 0 < capacity < model_mem:
+            raise ValueError(
+                f"Single node has {capacity:.0f}MB but model needs "
+                f"~{model_mem:.0f}MB — waiting for more nodes"
+            )
         return {nid: (0, total_layers)}
 
     capacities = [(node["node_id"], _effective_capacity_mb(node)) for node in nodes]
