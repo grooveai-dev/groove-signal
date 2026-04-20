@@ -3,7 +3,7 @@
 Loads a subset of transformer layers from a HuggingFace causal LM,
 enabling layer-wise sharding across multiple compute nodes.
 
-Supported architectures: Llama, Qwen2.5 (both use model.model.layers).
+Supported architectures: Llama, Qwen2.5, Gemma (all use model.model.layers).
 """
 
 import logging
@@ -30,6 +30,7 @@ ALLOWED_MODELS = frozenset({
     "meta-llama/Meta-Llama-3-70B",
     "meta-llama/Meta-Llama-3.1-8B",
     "meta-llama/Meta-Llama-3.1-70B",
+    "google/gemma-3-4b",
 })
 
 
@@ -171,7 +172,7 @@ def load_model_shard(
 def _get_inner_model(model) -> nn.Module:
     """Navigate the model wrapper to get the inner transformer model.
 
-    Works for Llama, Qwen2.5, and similar architectures where
+    Works for Llama, Qwen2.5, Gemma, and similar architectures where
     the structure is model.model.layers.
     """
     if hasattr(model, "model") and hasattr(model.model, "layers"):
