@@ -91,7 +91,7 @@ detect_gpu() {
         nvidia_smi="/c/Windows/System32/nvidia-smi.exe"
     elif [[ -f "/c/WINDOWS/system32/nvidia-smi.exe" ]]; then
         nvidia_smi="/c/WINDOWS/system32/nvidia-smi.exe"
-    elif [[ -f "$SYSTEMROOT/System32/nvidia-smi.exe" ]]; then
+    elif [[ -n "${SYSTEMROOT:-}" && -f "$SYSTEMROOT/System32/nvidia-smi.exe" ]]; then
         nvidia_smi="$SYSTEMROOT/System32/nvidia-smi.exe"
     fi
 
