@@ -85,7 +85,7 @@ json_trap_handler() {
 detect_gpu() {
     if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
         echo "cuda"
-    elif python3 -c "import platform; exit(0 if platform.system()=='Darwin' else 1)" 2>/dev/null; then
+    elif $PYTHON_CMD -c "import platform; exit(0 if platform.system()=='Darwin' else 1)" 2>/dev/null; then
         local arch
         arch=$(uname -m)
         if [[ "$arch" == "arm64" ]]; then
@@ -98,13 +98,33 @@ detect_gpu() {
     fi
 }
 
-PYTHON_CMD="python3"
+find_python() {
+    if python3 --version &>/dev/null; then
+        echo "python3"
+    elif python --version &>/dev/null; then
+        echo "python"
+    else
+        echo ""
+    fi
+}
+
+activate_venv() {
+    if [[ -f "venv/Scripts/activate" ]]; then
+        # shellcheck disable=SC1091
+        source venv/Scripts/activate
+    elif [[ -f "venv/bin/activate" ]]; then
+        # shellcheck disable=SC1091
+        source venv/bin/activate
+    fi
+}
+
+PYTHON_CMD="$(find_python)"
 DETECTED_PY_VERSION=""
 
 check_python_version() {
     json_emit "checking-python" "Checking Python version..." 5
     local py_version
-    py_version=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')" 2>/dev/null)
+    py_version=$($PYTHON_CMD -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')" 2>/dev/null)
     if [[ -z "$py_version" ]]; then
         error "python3 not found. Please install Python 3.10–3.12."
         json_error "python3 not found" "PYTHON_VERSION"
@@ -160,7 +180,7 @@ install_deps() {
         exit 1
     fi
     # shellcheck disable=SC1091
-    source venv/bin/activate
+    activate_venv
     json_emit "creating-venv" "Virtual environment created" 25
 
     log "Upgrading pip..."
@@ -255,7 +275,7 @@ print(f'  MPS:          {torch.backends.mps.is_available() if hasattr(torch.back
     fi
 
     local local_ip
-    local_ip=$(python3 -c "
+    local_ip=$($PYTHON_CMD -c "
 import socket
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 try:
@@ -319,7 +339,7 @@ run_tests() {
         error "Run 'bash setup.sh' first to install dependencies"
         exit 1
     fi
-    source venv/bin/activate
+    activate_venv
     log "Running test suite..."
     python -m pytest tests/ -v
 }
@@ -329,13 +349,13 @@ run_smoke() {
         error "Run 'bash setup.sh' first to install dependencies"
         exit 1
     fi
-    source venv/bin/activate
+    activate_venv
 
     local gpu_type
     gpu_type=$(detect_gpu)
     log "Running smoke test with Qwen2.5-0.5B on $gpu_type..."
 
-    python3 -c "
+    $PYTHON_CMD -c "
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from src.node.shard_loader import forward_shard
@@ -403,9 +423,9 @@ show_info() {
         error "Run 'bash setup.sh' first to install dependencies"
         exit 1
     fi
-    source venv/bin/activate
+    activate_venv
 
-    python3 - "$model_name" <<'PYEOF'
+    $PYTHON_CMD - "$model_name" <<'PYEOF'
 import sys
 from src.node.shard_loader import get_model_info
 model_name = sys.argv[1]
@@ -434,8 +454,8 @@ show_status() {
 
     if [[ -d "venv" ]]; then
         echo "Venv: INSTALLED"
-        source venv/bin/activate
-        python3 -c "
+        activate_venv
+        $PYTHON_CMD -c "
 import torch
 print(f'  PyTorch: {torch.__version__}')
 print(f'  CUDA:    {torch.cuda.is_available()}')
@@ -470,12 +490,12 @@ show_status_json() {
 
     if [[ -d "venv" ]]; then
         venv=true
-        if [[ -f "venv/bin/activate" ]]; then
+        if [[ -f "venv/Scripts/activate" ]] || [[ -f "venv/bin/activate" ]]; then
             # shellcheck disable=SC1091
-            source venv/bin/activate 2>/dev/null || true
-            py_version=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')" 2>/dev/null || echo "")
+            activate_venv
+            py_version=$($PYTHON_CMD -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')" 2>/dev/null || echo "")
             local probe
-            probe=$(python3 -c "
+            probe=$($PYTHON_CMD -c "
 import json
 try:
     import torch
@@ -491,10 +511,10 @@ try:
 except Exception:
     print(json.dumps({'torch': '', 'cuda': False, 'mps': False, 'device': ''}))
 " 2>/dev/null || echo '{"torch": "", "cuda": false, "mps": false, "device": ""}')
-            torch_version=$(python3 -c "import json,sys; d=json.loads('''$probe'''); print(d.get('torch',''))" 2>/dev/null || echo "")
-            cuda=$(python3 -c "import json; d=json.loads('''$probe'''); print('true' if d.get('cuda') else 'false')" 2>/dev/null || echo "false")
-            mps=$(python3 -c "import json; d=json.loads('''$probe'''); print('true' if d.get('mps') else 'false')" 2>/dev/null || echo "false")
-            device=$(python3 -c "import json; d=json.loads('''$probe'''); print(d.get('device',''))" 2>/dev/null || echo "")
+            torch_version=$($PYTHON_CMD -c "import json,sys; d=json.loads('''$probe'''); print(d.get('torch',''))" 2>/dev/null || echo "")
+            cuda=$($PYTHON_CMD -c "import json; d=json.loads('''$probe'''); print('true' if d.get('cuda') else 'false')" 2>/dev/null || echo "false")
+            mps=$($PYTHON_CMD -c "import json; d=json.loads('''$probe'''); print('true' if d.get('mps') else 'false')" 2>/dev/null || echo "false")
+            device=$($PYTHON_CMD -c "import json; d=json.loads('''$probe'''); print(d.get('device',''))" 2>/dev/null || echo "")
             if [[ -n "$torch_version" ]]; then
                 installed=true
             fi
