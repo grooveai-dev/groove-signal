@@ -89,6 +89,7 @@ def _capabilities(
             pass
     elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
         gpu_model = "Apple Silicon"
+        vram_mb = int(ram_mb * 0.75)
 
     try:
         ram_used_mb = int(psutil.virtual_memory().used / (1024 * 1024))
@@ -477,6 +478,30 @@ class ComputeNodeServer:
                 "ASSIGN_LAYERS model=%s layers=[%d,%d)",
                 model_name, layer_start, layer_end,
             )
+
+            from src.relay.scheduler import MODEL_REGISTRY, _effective_capacity_mb
+            reg = MODEL_REGISTRY.get(model_name)
+            if reg:
+                mem_needed = (layer_end - layer_start) * reg.get("memory_per_layer_mb", 0)
+                caps = _capabilities(
+                    model_name, self.device, self.max_context,
+                )
+                cap_mb = _effective_capacity_mb(caps)
+                if mem_needed > 0 and 0 < cap_mb < mem_needed:
+                    reason = (
+                        f"node has {cap_mb:.0f}MB but shard needs "
+                        f"~{mem_needed:.0f}MB"
+                    )
+                    logger.warning("rejecting assignment: %s", reason)
+                    await self._send_ack(
+                        ws, accepted=False,
+                        model_name=model_name,
+                        layer_start=layer_start,
+                        layer_end=layer_end,
+                        reason=reason,
+                    )
+                    return
+
             started = time.perf_counter()
             try:
                 shard = await self._load_shard_async(model_name, layer_start, layer_end)
