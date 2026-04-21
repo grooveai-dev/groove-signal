@@ -61,8 +61,8 @@ def get_model_info(model_name: str) -> dict:
 
 
 def _detect_device(requested: str) -> str:
-    """Auto-detect the best device, honoring explicit non-cpu requests."""
-    if requested and requested != "cpu":
+    """Auto-detect the best device, or honor an explicit request."""
+    if requested and requested != "auto":
         return requested
     if torch.cuda.is_available():
         return "cuda"
@@ -75,7 +75,7 @@ def load_model_shard(
     model_name: str,
     layer_start: int,
     layer_end: int,
-    device: str = "cpu",
+    device: str = "auto",
     quantize: bool = False,
 ) -> dict:
     """Load a specific layer range from a HuggingFace causal LM.

@@ -802,7 +802,7 @@ def main() -> None:
         "--relay",
         help="Legacy relay address, format HOST:PORT (use --signal for production)",
     )
-    parser.add_argument("--device", default="cpu", help="Device to use (cpu, cuda, mps)")
+    parser.add_argument("--device", default="auto", help="Device to use (auto, cpu, cuda, mps)")
     parser.add_argument("--max-context", type=int, default=4096)
     parser.add_argument("--quantize", action="store_true")
     parser.add_argument("--node-id", default=None, help="Override the node id (rarely needed)")
