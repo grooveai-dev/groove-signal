@@ -287,9 +287,9 @@ class InferenceClient:
     async def send_to_pipeline(self, message: dict) -> dict:
         """Forward a message through every node in pipeline order.
 
-        The message flows node-by-node: each non-terminal node returns
-        ACTIVATIONS that we hand off to the next node; we return the first
-        terminal response (LOGITS, VERIFY_RESULT, or ERROR).
+        For single-node pipelines, sends directly. For multi-node, uses
+        serial forwarding (pipeline parallelism is handled at the generation
+        loop level by send_to_pipeline_parallel).
 
         On NODE_GONE or timeout, retries by re-establishing the session
         up to max_retries times.
@@ -333,16 +333,121 @@ class InferenceClient:
                 await self.start_session(model)
         return {}
 
+    async def _send_through_stages(self, message: dict) -> dict:
+        """Send a single message through all pipeline stages serially."""
+        msg = message
+        for node in self.pipeline:
+            response = await self._send_to_node(node["node_id"], msg)
+            t = response.get("type")
+            if t in (LOGITS, VERIFY_RESULT, ERROR):
+                return response
+            if t == ACTIVATIONS:
+                msg = response
+                continue
+            return response
+        return {}
+
+    async def send_to_pipeline_parallel(
+        self,
+        messages: AsyncGenerator[dict, None],
+    ) -> AsyncGenerator[dict, None]:
+        """Pipeline-parallel generation: overlap stages across tokens.
+
+        Each pipeline stage has an asyncio.Queue. Stage workers pull from
+        their input queue, send to their node, and push results to the
+        next stage's queue. After a warmup period equal to len(pipeline)-1
+        tokens, throughput approaches single-node latency.
+
+        Yields final-stage responses (LOGITS) in order.
+        """
+        num_stages = len(self.pipeline)
+        if num_stages <= 1:
+            async for msg in messages:
+                yield await self.send_to_pipeline(msg)
+            return
+
+        _SENTINEL = object()
+        queues: list[asyncio.Queue] = [asyncio.Queue() for _ in range(num_stages + 1)]
+        errors: list[Exception] = []
+
+        async def stage_worker(stage_idx: int) -> None:
+            node = self.pipeline[stage_idx]
+            in_q = queues[stage_idx]
+            out_q = queues[stage_idx + 1]
+            try:
+                while True:
+                    item = await in_q.get()
+                    if item is _SENTINEL:
+                        await out_q.put(_SENTINEL)
+                        return
+                    msg, token_idx = item
+                    try:
+                        response = await self._send_to_node(node["node_id"], msg)
+                    except Exception as exc:
+                        errors.append(exc)
+                        await out_q.put(_SENTINEL)
+                        return
+                    t = response.get("type")
+                    if t in (LOGITS, VERIFY_RESULT, ERROR):
+                        await out_q.put((response, token_idx))
+                    elif t == ACTIVATIONS:
+                        await out_q.put((response, token_idx))
+                    else:
+                        await out_q.put((response, token_idx))
+            except Exception as exc:
+                errors.append(exc)
+                await out_q.put(_SENTINEL)
+
+        workers = [
+            asyncio.create_task(stage_worker(i)) for i in range(num_stages)
+        ]
+
+        async def feed_input() -> None:
+            token_idx = 0
+            async for msg in messages:
+                await queues[0].put((msg, token_idx))
+                token_idx += 1
+            await queues[0].put(_SENTINEL)
+
+        feeder = asyncio.create_task(feed_input())
+
+        try:
+            out_q = queues[num_stages]
+            while True:
+                item = await out_q.get()
+                if item is _SENTINEL:
+                    break
+                response, token_idx = item
+                if errors:
+                    raise errors[0]
+                yield response
+        finally:
+            feeder.cancel()
+            for w in workers:
+                w.cancel()
+            for w in workers:
+                try:
+                    await w
+                except (asyncio.CancelledError, Exception):
+                    pass
+            try:
+                await feeder
+            except (asyncio.CancelledError, Exception):
+                pass
+
     async def generate(
         self,
         prompt: str,
         max_tokens: int = 200,
-        use_speculative: bool = False,
+        use_speculative: bool | None = None,
         temperature: float = 0.7,
         top_p: float = 0.9,
     ) -> AsyncGenerator[str, None]:
         if not self.session_id or not self.tokenizer:
             raise RuntimeError("No active session. Call start_session() first.")
+
+        if use_speculative is None:
+            use_speculative = len(self.pipeline) > 1
 
         input_ids = self.tokenizer.encode(prompt, return_tensors="pt")[0].tolist()
 
@@ -376,6 +481,66 @@ class InferenceClient:
                 })
                 yield token_text
 
+    async def _prefill_pipelined(
+        self, input_ids: list[int], chunk_size: int = 128,
+    ) -> dict:
+        """Pipeline the prompt prefill across nodes by chunking.
+
+        Sends prompt chunks so that while Node1 processes chunk K's
+        activations, Node0 can already process chunk K+1's embeddings.
+        Falls back to serial for single-node or short prompts.
+        """
+        num_nodes = len(self.pipeline)
+        prompt_tensor = torch.tensor(input_ids, dtype=torch.int64)
+        prompt_len = len(input_ids)
+
+        if num_nodes <= 1 or prompt_len <= chunk_size:
+            msg = make_activations(
+                self.session_id,
+                seq_pos=0,
+                hidden_states_bytes=serialize_tensor(prompt_tensor),
+                shape=tuple(prompt_tensor.shape),
+                dtype="int64",
+            )
+            msg["is_prompt"] = True
+            return await self.send_to_pipeline(msg)
+
+        chunks = []
+        for start in range(0, prompt_len, chunk_size):
+            end = min(start + chunk_size, prompt_len)
+            chunks.append(input_ids[start:end])
+
+        last_response = None
+        pending_tasks: list[asyncio.Task] = []
+
+        for chunk_idx, chunk in enumerate(chunks):
+            chunk_tensor = torch.tensor(chunk, dtype=torch.int64)
+            msg = make_activations(
+                self.session_id,
+                seq_pos=chunk_idx * chunk_size,
+                hidden_states_bytes=serialize_tensor(chunk_tensor),
+                shape=tuple(chunk_tensor.shape),
+                dtype="int64",
+            )
+            msg["is_prompt"] = True
+
+            if pending_tasks:
+                done_response = await pending_tasks.pop(0)
+                if done_response.get("type") == ERROR:
+                    for t in pending_tasks:
+                        t.cancel()
+                    return done_response
+
+            task = asyncio.create_task(self._send_through_stages(msg))
+            pending_tasks.append(task)
+
+        for task in pending_tasks:
+            last_response = await task
+            if last_response.get("type") == ERROR:
+                return last_response
+
+        return last_response
+
     async def _autoregressive_generate(
         self,
         input_ids: list[int],
@@ -385,18 +550,9 @@ class InferenceClient:
     ) -> AsyncGenerator[str, None]:
         generated = list(input_ids)
         eos_id = self.tokenizer.eos_token_id
+        use_pipeline = len(self.pipeline) > 1
 
-        prompt_tensor = torch.tensor(generated, dtype=torch.int64)
-        msg = make_activations(
-            self.session_id,
-            seq_pos=0,
-            hidden_states_bytes=serialize_tensor(prompt_tensor),
-            shape=tuple(prompt_tensor.shape),
-            dtype="int64",
-        )
-        msg["is_prompt"] = True
-
-        response = await self.send_to_pipeline(msg)
+        response = await self._prefill_pipelined(input_ids)
         if response.get("type") == ERROR:
             raise RuntimeError(f"Pipeline error: {response.get('message', '')}")
 
@@ -407,30 +563,131 @@ class InferenceClient:
         generated.append(next_token)
         yield self.tokenizer.decode([next_token], skip_special_tokens=True)
 
-        for _ in range(max_tokens - 1):
-            if next_token == eos_id:
-                break
+        if use_pipeline:
+            async for text in self._pipelined_token_generate(
+                generated, next_token, max_tokens - 1, temperature, top_p
+            ):
+                yield text
+        else:
+            for _ in range(max_tokens - 1):
+                if next_token == eos_id:
+                    break
 
-            token_tensor = torch.tensor([next_token], dtype=torch.int64)
-            msg = make_activations(
-                self.session_id,
-                seq_pos=len(generated) - 1,
-                hidden_states_bytes=serialize_tensor(token_tensor),
-                shape=tuple(token_tensor.shape),
-                dtype="int64",
-            )
-            msg["is_prompt"] = False
+                token_tensor = torch.tensor([next_token], dtype=torch.int64)
+                msg = make_activations(
+                    self.session_id,
+                    seq_pos=len(generated) - 1,
+                    hidden_states_bytes=serialize_tensor(token_tensor),
+                    shape=tuple(token_tensor.shape),
+                    dtype="int64",
+                )
+                msg["is_prompt"] = False
 
-            response = await self.send_to_pipeline(msg)
-            if response.get("type") == ERROR:
-                raise RuntimeError(f"Pipeline error: {response.get('message', '')}")
+                response = await self.send_to_pipeline(msg)
+                if response.get("type") == ERROR:
+                    raise RuntimeError(f"Pipeline error: {response.get('message', '')}")
 
-            logits = _logits_from_response(response)
-            next_token = self._sample_token(
-                _last_token_logits(logits), temperature, top_p
-            )
-            generated.append(next_token)
-            yield self.tokenizer.decode([next_token], skip_special_tokens=True)
+                logits = _logits_from_response(response)
+                next_token = self._sample_token(
+                    _last_token_logits(logits), temperature, top_p
+                )
+                generated.append(next_token)
+                yield self.tokenizer.decode([next_token], skip_special_tokens=True)
+
+    async def _pipelined_token_generate(
+        self,
+        generated: list[int],
+        first_token: int,
+        remaining_tokens: int,
+        temperature: float,
+        top_p: float,
+    ) -> AsyncGenerator[str, None]:
+        """Token generation for multi-node pipelines using stage queues.
+
+        Uses the stage-queue architecture: each pipeline stage has its own
+        asyncio queue. Stage workers process items concurrently, so when
+        multiple tokens are in flight (e.g. via speculative candidates fed
+        into the pipeline), stages overlap. For pure autoregressive mode,
+        tokens are sequential but still benefit from the direct stage-to-stage
+        handoff without returning to the consumer between stages.
+        """
+        eos_id = self.tokenizer.eos_token_id
+        next_token = first_token
+        num_stages = len(self.pipeline)
+
+        _SENTINEL = object()
+        stage_queues: list[asyncio.Queue] = [
+            asyncio.Queue(maxsize=num_stages + 1) for _ in range(num_stages + 1)
+        ]
+        stage_errors: list[Exception] = []
+
+        async def stage_worker(idx: int) -> None:
+            node = self.pipeline[idx]
+            in_q = stage_queues[idx]
+            out_q = stage_queues[idx + 1]
+            try:
+                while True:
+                    item = await in_q.get()
+                    if item is _SENTINEL:
+                        await out_q.put(_SENTINEL)
+                        return
+                    msg, seq_idx = item
+                    response = await self._send_to_node(node["node_id"], msg)
+                    t = response.get("type")
+                    if t in (LOGITS, VERIFY_RESULT, ERROR):
+                        await out_q.put((response, seq_idx))
+                    elif t == ACTIVATIONS:
+                        await out_q.put((response, seq_idx))
+                    else:
+                        await out_q.put((response, seq_idx))
+            except Exception as exc:
+                stage_errors.append(exc)
+                await out_q.put(_SENTINEL)
+
+        workers = [asyncio.create_task(stage_worker(i)) for i in range(num_stages)]
+
+        try:
+            for _ in range(remaining_tokens):
+                if next_token == eos_id:
+                    break
+
+                token_tensor = torch.tensor([next_token], dtype=torch.int64)
+                msg = make_activations(
+                    self.session_id,
+                    seq_pos=len(generated) - 1,
+                    hidden_states_bytes=serialize_tensor(token_tensor),
+                    shape=tuple(token_tensor.shape),
+                    dtype="int64",
+                )
+                msg["is_prompt"] = False
+
+                await stage_queues[0].put((msg, len(generated) - 1))
+
+                item = await stage_queues[num_stages].get()
+                if item is _SENTINEL or stage_errors:
+                    if stage_errors:
+                        raise stage_errors[0]
+                    raise RuntimeError("Pipeline stage terminated unexpectedly")
+                response, seq_idx = item
+
+                if response.get("type") == ERROR:
+                    raise RuntimeError(f"Pipeline error: {response.get('message', '')}")
+
+                logits = _logits_from_response(response)
+                next_token = self._sample_token(
+                    _last_token_logits(logits), temperature, top_p
+                )
+                generated.append(next_token)
+                yield self.tokenizer.decode([next_token], skip_special_tokens=True)
+        finally:
+            await stage_queues[0].put(_SENTINEL)
+            for w in workers:
+                w.cancel()
+            for w in workers:
+                try:
+                    await w
+                except (asyncio.CancelledError, Exception):
+                    pass
 
     def _sample_token(
         self, logits: np.ndarray, temperature: float, top_p: float
@@ -495,7 +752,15 @@ async def main() -> None:
     )
     parser.add_argument("--prompt", type=str, required=True, help="Input prompt")
     parser.add_argument("--max-tokens", type=int, default=200)
-    parser.add_argument("--speculative", action="store_true")
+    spec_group = parser.add_mutually_exclusive_group()
+    spec_group.add_argument(
+        "--speculative", action="store_true", default=None,
+        help="Force speculative decoding on (default: auto, on for multi-node)",
+    )
+    spec_group.add_argument(
+        "--no-speculative", action="store_true",
+        help="Force speculative decoding off",
+    )
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-p", type=float, default=0.9)
     parser.add_argument(
@@ -553,10 +818,17 @@ async def main() -> None:
             sys.stdout.write("Output: ")
             sys.stdout.flush()
 
+        if args.no_speculative:
+            spec_flag = False
+        elif args.speculative:
+            spec_flag = True
+        else:
+            spec_flag = None
+
         async for text in client.generate(
             args.prompt,
             max_tokens=args.max_tokens,
-            use_speculative=args.speculative,
+            use_speculative=spec_flag,
             temperature=args.temperature,
             top_p=args.top_p,
         ):

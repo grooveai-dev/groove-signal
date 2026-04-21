@@ -4,6 +4,7 @@ Uses raw numpy byte buffers — no pickle (security), no torch.save (slow).
 Target: <1ms round-trip for 8KB tensors on local network.
 """
 
+import io
 import struct
 
 import numpy as np
@@ -43,7 +44,9 @@ _NP_TO_TORCH = {
 
 def _torch_to_numpy_safe(tensor: torch.Tensor) -> np.ndarray:
     """Convert a torch tensor to numpy, handling bfloat16 specially."""
-    t = tensor.detach().cpu()
+    t = tensor.detach()
+    if not t.is_cpu:
+        t = t.cpu()
     if t.dtype == torch.bfloat16:
         return t.to(torch.float16).numpy()
     return t.numpy()
@@ -62,19 +65,19 @@ def serialize_tensor(tensor: torch.Tensor) -> bytes:
     arr = _torch_to_numpy_safe(tensor)
     if tensor.dtype == torch.bfloat16:
         dtype_str = "bfloat16"
-    raw_data = arr.tobytes()
 
     dtype_bytes = dtype_str.encode("ascii")
     ndim = len(shape)
 
-    parts = [struct.pack(_NDIM_FMT, ndim)]
-    for dim in shape:
-        parts.append(struct.pack(_DIM_FMT, dim))
-    parts.append(struct.pack(_DTYPE_LEN_FMT, len(dtype_bytes)))
-    parts.append(dtype_bytes)
-    parts.append(raw_data)
+    header_fmt = f"!B{ndim}iB"
+    header = struct.pack(header_fmt, ndim, *shape, len(dtype_bytes))
 
-    return b"".join(parts)
+    buf = io.BytesIO()
+    buf.write(header)
+    buf.write(dtype_bytes)
+    buf.write(arr.tobytes())
+
+    return buf.getvalue()
 
 
 _MAX_TENSOR_NDIM = 8
@@ -95,11 +98,12 @@ def deserialize_tensor(data: bytes, device: str = "cpu") -> torch.Tensor:
     if ndim > _MAX_TENSOR_NDIM:
         raise ValueError(f"tensor ndim {ndim} exceeds maximum {_MAX_TENSOR_NDIM}")
 
-    shape = []
-    for _ in range(ndim):
-        (dim,) = struct.unpack_from(_DIM_FMT, data, offset)
-        shape.append(dim)
-        offset += struct.calcsize(_DIM_FMT)
+    if ndim > 0:
+        shape_fmt = f"!{ndim}i"
+        shape = list(struct.unpack_from(shape_fmt, data, offset))
+        offset += struct.calcsize(shape_fmt)
+    else:
+        shape = []
 
     for dim in shape:
         if dim <= 0:
@@ -122,17 +126,16 @@ def deserialize_tensor(data: bytes, device: str = "cpu") -> torch.Tensor:
     if dtype_str != "bfloat16" and dtype_str not in _NP_TO_TORCH:
         raise ValueError(f"unsupported tensor dtype: {dtype_str!r}")
 
-    raw_data = data[offset:]
-
     if dtype_str == "bfloat16":
         expected_bytes = total_elements * 2
     else:
         expected_bytes = total_elements * np.dtype(dtype_str).itemsize
-    if len(raw_data) < expected_bytes:
+
+    if len(data) - offset < expected_bytes:
         raise ValueError(
-            f"tensor data too short: got {len(raw_data)} bytes, expected {expected_bytes}"
+            f"tensor data too short: got {len(data) - offset} bytes, expected {expected_bytes}"
         )
-    raw_data = raw_data[:expected_bytes]
+    raw_data = data[offset : offset + expected_bytes]
 
     if dtype_str == "bfloat16":
         arr = np.frombuffer(raw_data, dtype=np.float16).reshape(shape)

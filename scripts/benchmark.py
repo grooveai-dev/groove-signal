@@ -133,10 +133,16 @@ async def run_scenario(
         first_token_time: Optional[float] = None
         token_count = 0
 
+        spec = scenario.get("speculative")
+        if spec is None:
+            spec_flag = None
+        else:
+            spec_flag = bool(spec)
+
         async for text in client.generate(
             config["prompt"],
             max_tokens=config["max_tokens"],
-            use_speculative=scenario.get("speculative", False),
+            use_speculative=spec_flag,
             temperature=config["temperature"],
         ):
             if first_token_time is None:

@@ -60,6 +60,17 @@ def get_model_info(model_name: str) -> dict:
     }
 
 
+def _detect_device(requested: str) -> str:
+    """Auto-detect the best device, honoring explicit non-cpu requests."""
+    if requested and requested != "cpu":
+        return requested
+    if torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 def load_model_shard(
     model_name: str,
     layer_start: int,
@@ -73,7 +84,7 @@ def load_model_shard(
         model_name: HuggingFace model identifier (e.g. "Qwen/Qwen2.5-7B").
         layer_start: First layer index (inclusive, 0-based).
         layer_end: Last layer index (exclusive).
-        device: Target device ("cpu", "cuda", "mps").
+        device: Target device ("cpu", "cuda", "mps"). Auto-detects GPU if "cpu".
         quantize: If True, load in 4-bit quantization via bitsandbytes.
 
     Returns:
@@ -97,13 +108,15 @@ def load_model_shard(
             f"with {total_layers} layers"
         )
 
+    target_device = _detect_device(device)
+
     is_first_shard = layer_start == 0
     is_last_shard = layer_end == total_layers
 
     logger.info(
-        "Loading shard [%d, %d) of %d layers from %s (first=%s, last=%s)",
+        "Loading shard [%d, %d) of %d layers from %s (first=%s, last=%s, device=%s)",
         layer_start, layer_end, total_layers, model_name,
-        is_first_shard, is_last_shard,
+        is_first_shard, is_last_shard, target_device,
     )
 
     load_kwargs = {
@@ -125,7 +138,12 @@ def load_model_shard(
             logger.warning("bitsandbytes not available, loading without quantization")
 
     if not quantize:
-        load_kwargs["device_map"] = "cpu"
+        if target_device == "cpu":
+            load_kwargs["device_map"] = "cpu"
+        elif target_device.startswith("cuda"):
+            load_kwargs["device_map"] = target_device
+        else:
+            load_kwargs["device_map"] = "cpu"
 
     model = AutoModelForCausalLM.from_pretrained(**load_kwargs)
 
@@ -153,14 +171,16 @@ def load_model_shard(
         "total_layers": total_layers,
     }
 
-    if not quantize and device != "cpu":
-        _move_shard_to_device(shard, device)
+    if not quantize and target_device not in ("cpu",):
+        current_device = next(shard["layers"].parameters()).device
+        if str(current_device) != target_device:
+            _move_shard_to_device(shard, target_device)
 
     _cleanup_unused_params(model, shard)
 
     logger.info(
         "Shard loaded: %d layers, device=%s, mem=%.1fMB",
-        layer_end - layer_start, device,
+        layer_end - layer_start, target_device,
         _estimate_shard_memory_mb(shard),
     )
 

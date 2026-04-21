@@ -108,19 +108,7 @@ class SpeculativeDecoder:
         tokens_generated = 0
         eos_id = self.client.tokenizer.eos_token_id
 
-        prompt_tensor = torch.tensor(generated, dtype=torch.int64)
-        prompt_blob = serialize_tensor(prompt_tensor)
-
-        init_msg = {
-            "type": ACTIVATIONS,
-            "session_id": self.client.session_id,
-            "seq_pos": 0,
-            "hidden_states_bytes": prompt_blob,
-            "shape": list(prompt_tensor.shape),
-            "dtype": "int64",
-            "is_prompt": True,
-        }
-        response = await self.client.send_to_pipeline(init_msg)
+        response = await self.client._prefill_pipelined(prompt_ids)
 
         if response["type"] == ERROR:
             raise RuntimeError(f"Prefill error: {response['message']}")
