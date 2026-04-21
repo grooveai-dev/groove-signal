@@ -83,19 +83,34 @@ json_trap_handler() {
 }
 
 detect_gpu() {
-    if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
+    # 1. Check NVIDIA GPU — try multiple paths (Electron/daemon may have limited PATH)
+    local nvidia_smi=""
+    if command -v nvidia-smi &>/dev/null; then
+        nvidia_smi="nvidia-smi"
+    elif [[ -f "/c/Windows/System32/nvidia-smi.exe" ]]; then
+        nvidia_smi="/c/Windows/System32/nvidia-smi.exe"
+    elif [[ -f "/c/WINDOWS/system32/nvidia-smi.exe" ]]; then
+        nvidia_smi="/c/WINDOWS/system32/nvidia-smi.exe"
+    elif [[ -f "$SYSTEMROOT/System32/nvidia-smi.exe" ]]; then
+        nvidia_smi="$SYSTEMROOT/System32/nvidia-smi.exe"
+    fi
+
+    if [[ -n "$nvidia_smi" ]] && "$nvidia_smi" &>/dev/null; then
         echo "cuda"
-    elif $PYTHON_CMD -c "import platform; exit(0 if platform.system()=='Darwin' else 1)" 2>/dev/null; then
-        local arch
-        arch=$(uname -m)
-        if [[ "$arch" == "arm64" ]]; then
+        return
+    fi
+
+    # 2. Check macOS (MPS for Apple Silicon, CPU for Intel)
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        if [[ "$(uname -m)" == "arm64" ]]; then
             echo "mps"
         else
             echo "macos-cpu"
         fi
-    else
-        echo "cpu"
+        return
     fi
+
+    echo "cpu"
 }
 
 find_python() {
@@ -207,36 +222,71 @@ install_deps() {
     json_emit "installing-deps" "Dependencies installed" 45
 
     json_emit "installing-torch" "Installing PyTorch ($gpu_type)..." 50
-    local torch_ok=0
-    if [[ "$gpu_type" == "cuda" ]]; then
-        log "Installing PyTorch with CUDA support..."
-        "$PYTHON_CMD" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124 --force-reinstall --no-deps --quiet && torch_ok=1
-        if (( torch_ok == 0 )); then
-            log "cu124 unavailable, trying cu121..."
-            "$PYTHON_CMD" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121 --force-reinstall --no-deps --quiet && torch_ok=1
+    install_torch() {
+        local torch_ok=0
+        if [[ "$gpu_type" == "cuda" ]]; then
+            log "Installing PyTorch with CUDA support..."
+            "$PYTHON_CMD" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124 --force-reinstall --no-deps --quiet && torch_ok=1
+            if (( torch_ok == 0 )); then
+                log "cu124 unavailable, trying cu121..."
+                "$PYTHON_CMD" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121 --force-reinstall --no-deps --quiet && torch_ok=1
+            fi
+        elif [[ "$gpu_type" == "mps" ]]; then
+            log "Installing PyTorch with MPS (Apple Silicon) support..."
+            "$PYTHON_CMD" -m pip install torch torchvision torchaudio --quiet && torch_ok=1
+        elif [[ "$gpu_type" == "macos-cpu" ]]; then
+            log "Installing PyTorch for macOS Intel (CPU)..."
+            "$PYTHON_CMD" -m pip install torch torchvision torchaudio --quiet && torch_ok=1
+        else
+            log "Installing PyTorch (Linux CPU only)..."
+            "$PYTHON_CMD" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu --force-reinstall --no-deps --quiet && torch_ok=1
         fi
-    elif [[ "$gpu_type" == "mps" ]]; then
-        log "Installing PyTorch with MPS (Apple Silicon) support..."
-        "$PYTHON_CMD" -m pip install torch torchvision torchaudio --quiet && torch_ok=1
-    elif [[ "$gpu_type" == "macos-cpu" ]]; then
-        log "Installing PyTorch for macOS Intel (CPU)..."
-        "$PYTHON_CMD" -m pip install torch torchvision torchaudio --quiet && torch_ok=1
-    else
-        log "Installing PyTorch (Linux CPU only)..."
-        "$PYTHON_CMD" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu --force-reinstall --no-deps --quiet && torch_ok=1
-    fi
-    if (( torch_ok == 0 )); then
+        return $(( 1 - torch_ok ))
+    }
+    if ! install_torch; then
         error "Failed to install PyTorch"
         json_error "Failed to install PyTorch" "TORCH_INSTALL"
         JSON_ERROR_EMITTED=1
         exit 1
     fi
-    json_emit "installing-torch" "PyTorch installed" 85
+    json_emit "installing-torch" "PyTorch installed" 75
 
-    json_emit "verifying" "Verifying installation..." 90
+    json_emit "verifying" "Verifying installation..." 80
     log "Verifying installation..."
+
+    # Ask Python what actually works — this is the source of truth.
+    local actual_device
+    actual_device=$("$PYTHON_CMD" -c "
+import torch
+if torch.cuda.is_available():
+    print('cuda')
+elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+    print('mps')
+else:
+    print('cpu')
+" 2>/dev/null || echo "cpu")
+
+    # Auto-correct: GPU detected by system but PyTorch can't use it.
+    if [[ "$gpu_type" == "cuda" && "$actual_device" != "cuda" ]]; then
+        warn "CUDA GPU detected but PyTorch reports CPU-only (got torch $(\"$PYTHON_CMD\" -c 'import torch; print(torch.__version__)' 2>/dev/null))"
+        warn "Force-reinstalling PyTorch with CUDA support..."
+        json_emit "installing-torch" "Reinstalling PyTorch with CUDA (fixing CPU-only build)..." 82
+        if install_torch; then
+            actual_device=$("$PYTHON_CMD" -c "
+import torch
+if torch.cuda.is_available():
+    print('cuda')
+else:
+    print('cpu')
+" 2>/dev/null || echo "cpu")
+        fi
+        if [[ "$actual_device" != "cuda" ]]; then
+            warn "Could not enable CUDA — falling back to CPU. Check NVIDIA drivers."
+        fi
+    fi
+
     local verify_output
-    if ! verify_output=$(python -c "
+    if ! verify_output=$("$PYTHON_CMD" -c "
 import torch
 import transformers
 import websockets
@@ -263,13 +313,10 @@ print(f'  MPS:          {torch.backends.mps.is_available() if hasattr(torch.back
     fi
     json_emit "verifying" "All packages verified" 95
 
-    local torch_device="$gpu_type"
-    if [[ "$torch_device" == "macos-cpu" ]]; then
-        torch_device="cpu"
-    fi
+    local torch_device="$actual_device"
 
     local torch_version
-    torch_version=$(python -c "import torch; print(torch.__version__)" 2>/dev/null || echo "unknown")
+    torch_version=$("$PYTHON_CMD" -c "import torch; print(torch.__version__)" 2>/dev/null || echo "unknown")
 
     # Emit the done event with extra fields (device, python, torch).
     if $JSON_MODE; then
