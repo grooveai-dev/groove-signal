@@ -302,7 +302,11 @@ finally:
     echo "========================================="
     echo ""
     echo "Next steps:"
-    echo "  source venv/bin/activate"
+    if [[ -f "venv/Scripts/activate" ]]; then
+        echo "  source venv/Scripts/activate"
+    else
+        echo "  source venv/bin/activate"
+    fi
     echo ""
     echo "  # 1. Start the relay (coordinator machine):"
     echo "  python -m src.relay.relay --port 8770"
