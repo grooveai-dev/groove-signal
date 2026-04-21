@@ -176,6 +176,14 @@ class ComputeNodeServer:
                 device = "mps"
             else:
                 device = "cpu"
+        if device == "cpu":
+            import shutil
+            if shutil.which("nvidia-smi"):
+                logger.warning(
+                    "Running on CPU despite NVIDIA GPU present. "
+                    "Reinstall PyTorch with CUDA: pip install torch torchvision "
+                    "torchaudio --index-url https://download.pytorch.org/whl/cu121"
+                )
         self.device = device
         self.max_context = max_context
         self.quantize = quantize

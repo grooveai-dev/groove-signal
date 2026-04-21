@@ -7,6 +7,8 @@ Supported architectures: Qwen3, Qwen2.5 (all use model.model.layers).
 """
 
 import logging
+import shutil
+import subprocess
 
 import torch
 import torch.nn as nn
@@ -68,6 +70,23 @@ def _detect_device(requested: str) -> str:
         return "cuda"
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return "mps"
+    if shutil.which("nvidia-smi"):
+        try:
+            result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                gpu_name = result.stdout.strip().split("\n")[0]
+                logger.warning(
+                    "NVIDIA GPU detected (%s) but torch.cuda.is_available() is False. "
+                    "PyTorch was likely installed without CUDA support. "
+                    "Run: pip install torch torchvision torchaudio "
+                    "--index-url https://download.pytorch.org/whl/cu121",
+                    gpu_name,
+                )
+        except Exception:
+            pass
     return "cpu"
 
 

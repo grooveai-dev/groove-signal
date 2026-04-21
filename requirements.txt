@@ -1,4 +1,6 @@
-torch>=2.1.0
+# torch is installed separately by setup.sh with platform-specific
+# CUDA/MPS support. Do NOT add torch here — pip will pull the CPU-only
+# build from PyPI and overwrite the GPU version.
 transformers>=4.37.0,<5.0
 accelerate>=0.25.0
 websockets==14.1
