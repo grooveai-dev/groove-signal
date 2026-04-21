@@ -764,12 +764,14 @@ class ComputeNodeServer:
                     kv_cache.key_cache[layer_idx] = kv_cache.key_cache[layer_idx][:, :, :-trim_count, :]
                     kv_cache.value_cache[layer_idx] = kv_cache.value_cache[layer_idx][:, :, :-trim_count, :]
 
-        return make_verify_result(
+        result = make_verify_result(
             session_id=session_id,
             accepted_tokens=accepted_tokens,
             correction_token=correction_token,
             num_accepted=num_accepted,
         )
+        result["seq_pos"] = msg.get("seq_pos")
+        return result
 
     def _handle_heartbeat(self, msg: dict) -> dict:
         return make_heartbeat(node_id=self.node_id, status="active")

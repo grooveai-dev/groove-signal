@@ -447,7 +447,7 @@ class InferenceClient:
             raise RuntimeError("No active session. Call start_session() first.")
 
         if use_speculative is None:
-            use_speculative = len(self.pipeline) > 1
+            use_speculative = len(self.pipeline) == 1
 
         input_ids = self.tokenizer.encode(prompt, return_tensors="pt")[0].tolist()
 

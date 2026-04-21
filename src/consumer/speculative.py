@@ -62,6 +62,7 @@ class SpeculativeDecoder:
             "session_id": self.client.session_id,
             "candidate_ids": candidates,
             "turn": self.total_rounds,
+            "seq_pos": len(input_ids),
         }
         response = await self.client.send_to_pipeline(msg)
 
@@ -113,11 +114,11 @@ class SpeculativeDecoder:
         if response["type"] == ERROR:
             raise RuntimeError(f"Prefill error: {response['message']}")
 
-        from src.consumer.client import _logits_from_response
+        from src.consumer.client import _logits_from_response, _last_token_logits
 
         logits = _logits_from_response(response)
         first_token = self.client._sample_token(
-            logits[-1] if len(logits.shape) > 1 else logits, temperature, top_p
+            _last_token_logits(logits), temperature, top_p
         )
         generated.append(first_token)
         tokens_generated += 1
