@@ -196,11 +196,25 @@ install_deps() {
     gpu_type=$(detect_gpu)
     log "Detected compute device: $gpu_type"
 
-    json_emit "installing-torch" "Installing PyTorch ($gpu_type)..." 30
+    json_emit "installing-deps" "Installing dependencies..." 30
+    log "Installing remaining dependencies..."
+    if ! "$PYTHON_CMD" -m pip install -r requirements.txt --quiet; then
+        error "Failed to install dependencies from requirements.txt"
+        json_error "Failed to install dependencies" "DEPS_INSTALL"
+        JSON_ERROR_EMITTED=1
+        exit 1
+    fi
+    json_emit "installing-deps" "Dependencies installed" 45
+
+    json_emit "installing-torch" "Installing PyTorch ($gpu_type)..." 50
     local torch_ok=0
     if [[ "$gpu_type" == "cuda" ]]; then
         log "Installing PyTorch with CUDA support..."
-        "$PYTHON_CMD" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121 --quiet && torch_ok=1
+        "$PYTHON_CMD" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124 --force-reinstall --no-deps --quiet && torch_ok=1
+        if (( torch_ok == 0 )); then
+            log "cu124 unavailable, trying cu121..."
+            "$PYTHON_CMD" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121 --force-reinstall --no-deps --quiet && torch_ok=1
+        fi
     elif [[ "$gpu_type" == "mps" ]]; then
         log "Installing PyTorch with MPS (Apple Silicon) support..."
         "$PYTHON_CMD" -m pip install torch torchvision torchaudio --quiet && torch_ok=1
@@ -209,7 +223,7 @@ install_deps() {
         "$PYTHON_CMD" -m pip install torch torchvision torchaudio --quiet && torch_ok=1
     else
         log "Installing PyTorch (Linux CPU only)..."
-        "$PYTHON_CMD" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu --quiet && torch_ok=1
+        "$PYTHON_CMD" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu --force-reinstall --no-deps --quiet && torch_ok=1
     fi
     if (( torch_ok == 0 )); then
         error "Failed to install PyTorch"
@@ -217,17 +231,7 @@ install_deps() {
         JSON_ERROR_EMITTED=1
         exit 1
     fi
-    json_emit "installing-torch" "PyTorch installed" 60
-
-    json_emit "installing-deps" "Installing dependencies..." 65
-    log "Installing remaining dependencies..."
-    if ! "$PYTHON_CMD" -m pip install -r requirements.txt --quiet; then
-        error "Failed to install dependencies from requirements.txt"
-        json_error "Failed to install dependencies" "DEPS_INSTALL"
-        JSON_ERROR_EMITTED=1
-        exit 1
-    fi
-    json_emit "installing-deps" "Dependencies installed" 85
+    json_emit "installing-torch" "PyTorch installed" 85
 
     json_emit "verifying" "Verifying installation..." 90
     log "Verifying installation..."
