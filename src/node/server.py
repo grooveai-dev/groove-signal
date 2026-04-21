@@ -864,8 +864,19 @@ def main() -> None:
         from src.node.shard_loader import _validate_model_name
         _validate_model_name(args.model)
         try:
-            from huggingface_hub import snapshot_download
-            logger.info("Ensuring model weights are cached for %s...", args.model)
+            from huggingface_hub import snapshot_download, try_to_load_from_cache
+            from huggingface_hub.utils import LocalEntryNotFoundError
+
+            cached = try_to_load_from_cache(args.model, "config.json")
+            if cached is None or isinstance(cached, str) and not os.path.exists(cached):
+                logger.info(
+                    "Model %s not in local cache — downloading (~8 GB). "
+                    "This is a one-time download, please wait...",
+                    args.model,
+                )
+            else:
+                logger.info("Verifying cached model weights for %s...", args.model)
+
             snapshot_download(
                 args.model,
                 allow_patterns=["*.safetensors", "*.json"],
