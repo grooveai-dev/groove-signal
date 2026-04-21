@@ -123,11 +123,17 @@ DETECTED_PY_VERSION=""
 
 check_python_version() {
     json_emit "checking-python" "Checking Python version..." 5
-    local py_version
-    py_version=$($PYTHON_CMD -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')" 2>/dev/null)
-    if [[ -z "$py_version" ]]; then
+    if [[ -z "$PYTHON_CMD" ]]; then
         error "python3 not found. Please install Python 3.10–3.12."
         json_error "python3 not found" "PYTHON_VERSION"
+        JSON_ERROR_EMITTED=1
+        exit 1
+    fi
+    local py_version
+    py_version=$($PYTHON_CMD -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')" 2>/dev/null) || true
+    if [[ -z "$py_version" ]]; then
+        error "Python found ($PYTHON_CMD) but failed to run. Check your Python installation."
+        json_error "python3 not working" "PYTHON_VERSION"
         JSON_ERROR_EMITTED=1
         exit 1
     fi
@@ -184,7 +190,7 @@ install_deps() {
     json_emit "creating-venv" "Virtual environment created" 25
 
     log "Upgrading pip..."
-    pip install --upgrade pip --quiet >&2 2>/dev/null || pip install --upgrade pip --quiet
+    "$PYTHON_CMD" -m pip install --upgrade pip --quiet >&2 2>/dev/null || "$PYTHON_CMD" -m pip install --upgrade pip --quiet
 
     local gpu_type
     gpu_type=$(detect_gpu)
@@ -194,16 +200,16 @@ install_deps() {
     local torch_ok=0
     if [[ "$gpu_type" == "cuda" ]]; then
         log "Installing PyTorch with CUDA support..."
-        pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121 --quiet && torch_ok=1
+        "$PYTHON_CMD" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121 --quiet && torch_ok=1
     elif [[ "$gpu_type" == "mps" ]]; then
         log "Installing PyTorch with MPS (Apple Silicon) support..."
-        pip install torch torchvision torchaudio --quiet && torch_ok=1
+        "$PYTHON_CMD" -m pip install torch torchvision torchaudio --quiet && torch_ok=1
     elif [[ "$gpu_type" == "macos-cpu" ]]; then
         log "Installing PyTorch for macOS Intel (CPU)..."
-        pip install torch torchvision torchaudio --quiet && torch_ok=1
+        "$PYTHON_CMD" -m pip install torch torchvision torchaudio --quiet && torch_ok=1
     else
         log "Installing PyTorch (Linux CPU only)..."
-        pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu --quiet && torch_ok=1
+        "$PYTHON_CMD" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu --quiet && torch_ok=1
     fi
     if (( torch_ok == 0 )); then
         error "Failed to install PyTorch"
@@ -215,7 +221,7 @@ install_deps() {
 
     json_emit "installing-deps" "Installing dependencies..." 65
     log "Installing remaining dependencies..."
-    if ! pip install -r requirements.txt --quiet; then
+    if ! "$PYTHON_CMD" -m pip install -r requirements.txt --quiet; then
         error "Failed to install dependencies from requirements.txt"
         json_error "Failed to install dependencies" "DEPS_INSTALL"
         JSON_ERROR_EMITTED=1
