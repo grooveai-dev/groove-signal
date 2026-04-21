@@ -190,18 +190,30 @@ def load_model_shard(
         "total_layers": total_layers,
     }
 
-    if not quantize and target_device not in ("cpu",):
-        current_device = next(shard["layers"].parameters()).device
-        if str(current_device) != target_device:
-            _move_shard_to_device(shard, target_device)
-
     _cleanup_unused_params(model, shard)
 
-    logger.info(
-        "Shard loaded: %d layers, device=%s, mem=%.1fMB",
-        layer_end - layer_start, target_device,
-        _estimate_shard_memory_mb(shard),
-    )
+    actual_device = str(next(shard["layers"].parameters()).device)
+    if target_device not in ("cpu",) and not actual_device.startswith(target_device.split(":")[0]):
+        logger.warning(
+            "Model loaded on %s but target is %s — forcing move",
+            actual_device, target_device,
+        )
+        _move_shard_to_device(shard, target_device)
+        actual_device = str(next(shard["layers"].parameters()).device)
+
+    if actual_device.startswith("cuda"):
+        vram_alloc = torch.cuda.memory_allocated() / (1024 * 1024)
+        logger.info(
+            "Shard loaded: %d layers, device=%s (verified), mem=%.1fMB, cuda_alloc=%.1fMB",
+            layer_end - layer_start, actual_device,
+            _estimate_shard_memory_mb(shard), vram_alloc,
+        )
+    else:
+        logger.info(
+            "Shard loaded: %d layers, device=%s (verified), mem=%.1fMB",
+            layer_end - layer_start, actual_device,
+            _estimate_shard_memory_mb(shard),
+        )
 
     return shard
 

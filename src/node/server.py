@@ -660,6 +660,15 @@ class ComputeNodeServer:
         if hidden_states.dim() == 1:
             hidden_states = hidden_states.unsqueeze(0)
 
+        shard_device = str(next(self.shard["layers"].parameters()).device)
+        input_device = str(hidden_states.device)
+        if shard_device != input_device:
+            logger.warning(
+                "device mismatch: shard on %s, input on %s — moving input",
+                shard_device, input_device,
+            )
+            hidden_states = hidden_states.to(shard_device)
+
         session_cache = self.kv_manager.get_session(session_id)
         if session_cache is None:
             num_layers = self.layer_end - self.layer_start
