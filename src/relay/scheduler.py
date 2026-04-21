@@ -19,7 +19,7 @@ MODEL_REGISTRY: dict[str, dict] = {
         "hidden_size": 2560,
         "num_heads": 32,
         "vocab_size": 151936,
-        "memory_per_layer_mb": 110,
+        "memory_per_layer_mb": 220,
         "dtype": "bfloat16",
     },
     "Qwen/Qwen2.5-0.5B": {
