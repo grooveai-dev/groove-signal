@@ -16,6 +16,8 @@ signal.groovedev.ai) over TLS. The signal service handles node registration,
 scoring, consumer matching, and envelope routing.
 """
 
+from __future__ import annotations
+
 import argparse
 import asyncio
 import concurrent.futures
@@ -871,7 +873,7 @@ class ComputeNodeServer:
     def _handle_heartbeat(self, msg: dict) -> dict:
         return make_heartbeat(node_id=self.node_id, status="active")
 
-    def _get_peer_manager(self):
+    def _get_peer_manager(self, turn_servers: list[dict] | None = None):
         """Lazy-init PeerConnectionManager (backend agent's module)."""
         if self.peer_manager is not None:
             return self.peer_manager
@@ -883,15 +885,36 @@ class ComputeNodeServer:
                 "Install aiortc and ensure peer.py is present."
             )
             return None
-        self.peer_manager = PeerConnectionManager()
+        rtc_config = None
+        if turn_servers:
+            try:
+                from src.common.peer import build_rtc_config
+                rtc_config = build_rtc_config(turn_servers)
+            except (ImportError, Exception):
+                logger.warning("build_rtc_config unavailable, using default config")
+        self.peer_manager = PeerConnectionManager(rtc_config=rtc_config)
         return self.peer_manager
 
     async def _handle_sdp_offer(self, ws, msg: dict) -> None:
-        """Received via signal WS. Create answer, send back via signal."""
-        pm = self._get_peer_manager()
+        """Received via signal WS. Create answer, send back via signal.
+
+        Handles re-offers: if a peer already has a connection (reconnect
+        scenario), the old connection is closed and replaced.
+        """
+        turn_servers = msg.get("turn_servers")
+        pm = self._get_peer_manager(turn_servers=turn_servers)
         if pm is None:
             return
         from_id = msg.get("from_node_id", "")
+
+        if pm.is_connected(from_id) or from_id in self.p2p_channels:
+            logger.info("re-offer from %s, replacing old connection", from_id[:12])
+            self.p2p_channels.pop(from_id, None)
+            try:
+                await pm.close(from_id)
+            except Exception:
+                pass
+
         try:
             answer_sdp = await pm.handle_offer(from_id, msg["sdp"])
         except Exception:
@@ -951,6 +974,26 @@ class ComputeNodeServer:
 
         self.p2p_channels[peer_id] = ChunkedChannel(_p2p_send)
         logger.info("P2P channel ready with %s", peer_id[:12])
+
+        asyncio.create_task(self._monitor_peer_state(peer_id))
+
+    async def _monitor_peer_state(self, peer_id: str) -> None:
+        """Watch a peer connection and clean up its ChunkedChannel on drop."""
+        try:
+            while True:
+                await asyncio.sleep(2.0)
+                if self.peer_manager is None:
+                    break
+                if not self.peer_manager.is_connected(peer_id):
+                    if peer_id in self.p2p_channels:
+                        del self.p2p_channels[peer_id]
+                        logger.warning(
+                            "P2P channel dropped for %s, falling back to relay",
+                            peer_id[:12],
+                        )
+                    break
+        except asyncio.CancelledError:
+            return
 
 
 def parse_layer_range(layer_str: str) -> tuple[int, int]:

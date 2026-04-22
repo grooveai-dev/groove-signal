@@ -315,6 +315,7 @@ def make_pipeline_config(
     nodes: list[dict],
     stream_id: str | None = None,
     protocol_version: int = PROTOCOL_VERSION,
+    turn_servers: list[dict] | None = None,
 ) -> dict:
     msg = {
         "type": PIPELINE_CONFIG,
@@ -324,6 +325,8 @@ def make_pipeline_config(
     }
     if stream_id is not None:
         msg["stream_id"] = stream_id
+    if turn_servers:
+        msg["turn_servers"] = turn_servers
     return msg
 
 

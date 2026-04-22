@@ -6,7 +6,7 @@ import pytest
 
 from aiortc import RTCConfiguration
 
-from src.common.peer import PeerConnectionManager, _parse_ice_candidate
+from src.common.peer import PeerConnectionManager, build_rtc_config, _parse_ice_candidate
 
 
 @pytest.fixture
@@ -207,3 +207,34 @@ def test_parse_ice_candidate_srflx():
     assert ice.type == "srflx"
     assert ice.relatedAddress == "10.0.0.1"
     assert ice.relatedPort == 12345
+
+
+def test_build_rtc_config_stun_only():
+    config = build_rtc_config()
+    assert len(config.iceServers) == 2
+    assert config.iceServers[0].urls == ["stun:stun.l.google.com:19302"]
+    assert config.iceServers[1].urls == ["stun:stun1.l.google.com:19302"]
+
+
+def test_build_rtc_config_with_turn():
+    turn = [
+        {
+            "urls": ["turn:turn.groovedev.ai:3478"],
+            "username": "1234:node-a",
+            "credential": "abc123==",
+        }
+    ]
+    config = build_rtc_config(turn_servers=turn)
+    assert len(config.iceServers) == 3
+    assert config.iceServers[2].urls == ["turn:turn.groovedev.ai:3478"]
+    assert config.iceServers[2].username == "1234:node-a"
+    assert config.iceServers[2].credential == "abc123=="
+
+
+def test_build_rtc_config_multiple_turn():
+    turn = [
+        {"urls": ["turn:us.turn.groovedev.ai:3478"], "username": "u1", "credential": "p1"},
+        {"urls": ["turn:eu.turn.groovedev.ai:3478"], "username": "u2", "credential": "p2"},
+    ]
+    config = build_rtc_config(turn_servers=turn)
+    assert len(config.iceServers) == 4

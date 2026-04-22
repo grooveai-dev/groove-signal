@@ -24,16 +24,27 @@ logger = logging.getLogger("peer")
 
 
 def _default_rtc_config() -> RTCConfiguration:
-    """STUN/TURN configuration for NAT traversal."""
+    """STUN-only configuration for NAT traversal."""
     return RTCConfiguration(iceServers=[
         RTCIceServer(urls=["stun:stun.l.google.com:19302"]),
         RTCIceServer(urls=["stun:stun1.l.google.com:19302"]),
-        RTCIceServer(
-            urls=["turn:turn.groovedev.ai:3478"],
-            username="groove",
-            credential="<rotated-secret>",
-        ),
     ])
+
+
+def build_rtc_config(turn_servers: list[dict] | None = None) -> RTCConfiguration:
+    """Build RTC config with optional dynamic TURN credentials."""
+    servers = [
+        RTCIceServer(urls=["stun:stun.l.google.com:19302"]),
+        RTCIceServer(urls=["stun:stun1.l.google.com:19302"]),
+    ]
+    if turn_servers:
+        for ts in turn_servers:
+            servers.append(RTCIceServer(
+                urls=ts["urls"],
+                username=ts.get("username", ""),
+                credential=ts.get("credential", ""),
+            ))
+    return RTCConfiguration(iceServers=servers)
 
 
 @dataclass

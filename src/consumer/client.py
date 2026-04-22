@@ -11,6 +11,8 @@ M3: --signal flag connects to the Groove signal service over TLS. The signal
 service scores and matches nodes, then brokers the connection.
 """
 
+from __future__ import annotations
+
 import argparse
 import asyncio
 import json
@@ -18,6 +20,11 @@ import logging
 import sys
 import time
 from typing import AsyncGenerator, Optional
+
+try:
+    from src.common.peer import build_rtc_config
+except ImportError:
+    build_rtc_config = None
 
 import msgpack
 import numpy as np
@@ -101,6 +108,13 @@ class InferenceClient:
         self.peer_manager = None
         self.p2p_channels: dict[str, ChunkedChannel] = {}
         self.p2p_connected: set[str] = set()
+        self._turn_servers: list[dict] | None = None
+        self._p2p_monitor_task: asyncio.Task | None = None
+        self._reconnect_attempts: dict[str, int] = {}
+        self._p2p_send_count: int = 0
+        self._relay_send_count: int = 0
+        self._reconnect_count: int = 0
+        self._max_reconnect_per_peer: int = 3
 
     def emit_event(self, event: dict) -> None:
         """Print one JSON event line to stdout. No-op when json_mode is off."""
@@ -156,6 +170,7 @@ class InferenceClient:
 
         self.pipeline = response["nodes"]
         self.stream_id = response.get("stream_id")
+        self._turn_servers = response.get("turn_servers")
         if not self.stream_id:
             raise RuntimeError("Relay did not return a stream_id in PIPELINE_CONFIG")
 
@@ -199,13 +214,23 @@ class InferenceClient:
 
     async def _establish_p2p(self) -> None:
         """Attempt P2P WebRTC connections to all pipeline nodes."""
+        start_time = time.monotonic()
         try:
             from src.common.peer import PeerConnectionManager
         except ImportError:
             logger.info("P2P unavailable (peer.py not found), using relay")
             return
 
-        self.peer_manager = PeerConnectionManager()
+        rtc_config = None
+        if build_rtc_config is not None and self._turn_servers:
+            try:
+                rtc_config = build_rtc_config(self._turn_servers)
+            except Exception:
+                logger.warning("build_rtc_config failed, using default config")
+
+        self.peer_manager = PeerConnectionManager(
+            session_id=self.session_id, rtc_config=rtc_config,
+        )
         session_id = self.session_id or ""
 
         for node in self.pipeline:
@@ -241,10 +266,79 @@ class InferenceClient:
                     len(missing), ", ".join(missing),
                 )
 
+        logger.info(
+            "P2P setup complete",
+            extra={
+                "p2p_nodes": len(self.p2p_connected),
+                "relay_nodes": len(self.pipeline) - len(self.p2p_connected),
+                "setup_time_ms": round((time.monotonic() - start_time) * 1000),
+            },
+        )
+
+        self._p2p_monitor_task = asyncio.create_task(self._monitor_p2p())
+
     async def _wait_for_p2p(self) -> None:
         """Wait until all pipeline nodes are P2P-connected."""
         expected = {n["node_id"] for n in self.pipeline}
         while not expected.issubset(self.p2p_connected):
+            await asyncio.sleep(0.05)
+
+    async def _monitor_p2p(self) -> None:
+        """Background task: detect dropped P2P peers and attempt reconnection."""
+        try:
+            while True:
+                await asyncio.sleep(2.0)
+                if self.peer_manager is None:
+                    continue
+                for node_id in list(self.p2p_connected):
+                    if self.peer_manager.is_connected(node_id):
+                        continue
+                    self.p2p_connected.discard(node_id)
+                    self.p2p_channels.pop(node_id, None)
+                    logger.warning("P2P dropped for %s, falling back to relay", node_id[:12])
+
+                    attempts = self._reconnect_attempts.get(node_id, 0)
+                    if attempts >= self._max_reconnect_per_peer:
+                        logger.warning(
+                            "max reconnection attempts reached for %s", node_id[:12],
+                        )
+                        continue
+
+                    self._reconnect_attempts[node_id] = attempts + 1
+                    self._reconnect_count += 1
+
+                    try:
+                        await self.peer_manager.close(node_id)
+                    except Exception:
+                        pass
+
+                    try:
+                        offer_sdp = await self.peer_manager.create_offer(node_id)
+                        offer_msg = make_sdp_offer(
+                            session_id=self.session_id or "",
+                            from_node_id="consumer",
+                            to_node_id=node_id,
+                            sdp=offer_sdp,
+                        )
+                        await self.relay_ws.send(encode_message(offer_msg))
+                    except Exception:
+                        logger.warning("reconnect offer failed for %s", node_id[:12])
+                        continue
+
+                    try:
+                        await asyncio.wait_for(
+                            self._wait_for_peer_reconnect(node_id), timeout=5.0,
+                        )
+                        logger.info("P2P reconnected to %s", node_id[:12])
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "P2P reconnect timeout for %s, staying on relay", node_id[:12],
+                        )
+        except asyncio.CancelledError:
+            return
+
+    async def _wait_for_peer_reconnect(self, node_id: str) -> None:
+        while node_id not in self.p2p_connected:
             await asyncio.sleep(0.05)
 
     async def _receive_loop(self) -> None:
@@ -396,6 +490,7 @@ class InferenceClient:
         if node_id in self.p2p_connected and node_id in self.p2p_channels:
             try:
                 await self.p2p_channels[node_id].send_message(inner_bytes)
+                self._p2p_send_count += 1
             except Exception:
                 logger.warning("P2P send to %s failed, falling back to relay", node_id[:12])
                 self.p2p_connected.discard(node_id)
@@ -407,6 +502,7 @@ class InferenceClient:
                 )
                 try:
                     await self.relay_ws.send(encode_message(env))
+                    self._relay_send_count += 1
                 except Exception:
                     self._waiters.pop(seq, None)
                     raise
@@ -419,6 +515,7 @@ class InferenceClient:
             )
             try:
                 await self.relay_ws.send(encode_message(env))
+                self._relay_send_count += 1
             except Exception:
                 self._waiters.pop(seq, None)
                 raise
@@ -910,6 +1007,21 @@ class InferenceClient:
         if self._closed:
             return
         self._closed = True
+        if self._p2p_monitor_task is not None:
+            self._p2p_monitor_task.cancel()
+            try:
+                await self._p2p_monitor_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._p2p_monitor_task = None
+        logger.info(
+            "session transport stats",
+            extra={
+                "p2p_sends": self._p2p_send_count,
+                "relay_sends": self._relay_send_count,
+                "p2p_reconnects": self._reconnect_count,
+            },
+        )
         if self._recv_task is not None:
             self._recv_task.cancel()
             try:

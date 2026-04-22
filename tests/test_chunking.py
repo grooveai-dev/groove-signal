@@ -1,7 +1,13 @@
-"""Tests for src.common.chunking — ChunkedChannel chunking/reassembly."""
+"""Tests for src.common.chunking — ChunkedChannel chunking/reassembly.
+
+Also includes Phase 4 resilience tests: consumer TURN credentials,
+P2P reconnection monitor, and node SDP re-offer handling.
+"""
 
 import asyncio
 import struct
+import sys
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -12,6 +18,23 @@ from src.common.chunking import (
     MAX_PENDING_MESSAGES,
     ChunkedChannel,
 )
+
+
+def _ensure_mock_modules():
+    """Inject mock modules for heavy deps not in test env."""
+    stubs = {}
+    for mod_name in (
+        "torch", "torch.cuda", "torch.backends", "torch.backends.mps",
+        "numpy", "msgpack", "websockets", "websockets.asyncio",
+        "websockets.asyncio.client", "transformers",
+        "aiortc", "src.common.peer", "src.common.tensor_transfer",
+        "src.common.benchmark", "src.node.identity", "src.node.kv_cache",
+        "src.node.shard_loader",
+    ):
+        if mod_name not in sys.modules:
+            stubs[mod_name] = MagicMock()
+    sys.modules.update(stubs)
+    return stubs
 
 
 def _make_channel():
@@ -192,3 +215,314 @@ async def test_multiple_sequential_messages():
     for i, raw in enumerate(sent):
         msg_id, _, _, _ = struct.unpack(HEADER_FMT, raw[:HEADER_SIZE])
         assert msg_id == i
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 resilience tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=False)
+def _mock_heavy_deps():
+    """Mock torch/aiortc/etc for tests that import consumer/node modules."""
+    saved = {}
+    stubs = {}
+    for mod_name in (
+        "torch", "torch.cuda", "torch.backends", "torch.backends.mps",
+        "numpy", "np", "msgpack", "websockets", "websockets.asyncio",
+        "websockets.asyncio.client", "transformers",
+        "aiortc", "src.common.peer", "src.common.tensor_transfer",
+        "src.common.benchmark", "src.node.identity", "src.node.kv_cache",
+        "src.node.shard_loader",
+    ):
+        if mod_name in sys.modules:
+            saved[mod_name] = sys.modules[mod_name]
+        mock = MagicMock()
+        if mod_name == "torch":
+            mock.cuda.is_available.return_value = False
+            mock.backends.mps.is_available.return_value = False
+        if mod_name == "msgpack":
+            mock.packb.return_value = b'\x80'
+        stubs[mod_name] = mock
+    sys.modules.update(stubs)
+
+    # Force re-import of protocol (it's pure python, safe)
+    for key in list(sys.modules.keys()):
+        if key.startswith("src.consumer.") or key.startswith("src.node.server"):
+            del sys.modules[key]
+
+    yield
+
+    for mod_name, mock in stubs.items():
+        if mod_name in saved:
+            sys.modules[mod_name] = saved[mod_name]
+        else:
+            sys.modules.pop(mod_name, None)
+    for key in list(sys.modules.keys()):
+        if key.startswith("src.consumer.") or key.startswith("src.node.server"):
+            del sys.modules[key]
+
+
+def _make_consumer_client(**kwargs):
+    """Create an InferenceClient with mocked internals for unit testing."""
+    from src.consumer.client import InferenceClient
+
+    client = InferenceClient(relay_host="localhost", relay_port=8770, **kwargs)
+    client.session_id = "test-session"
+    client.stream_id = "test-stream"
+    client.relay_ws = AsyncMock()
+    return client
+
+
+@pytest.mark.usefixtures("_mock_heavy_deps")
+class TestConsumerTurnCredentials:
+    """TASK 1: Consumer extracts turn_servers from PIPELINE_CONFIG."""
+
+    def test_turn_servers_extracted_from_pipeline_config(self):
+        from src.consumer.client import InferenceClient
+        client = InferenceClient()
+        assert client._turn_servers is None
+
+    @pytest.mark.asyncio
+    async def test_establish_p2p_uses_turn_servers(self):
+        client = _make_consumer_client()
+        client._turn_servers = [
+            {"urls": "turn:relay.example.com:3478", "username": "u", "credential": "p"},
+        ]
+        client.pipeline = [{"node_id": "0xAABB"}]
+
+        mock_pm = MagicMock()
+        mock_pm.create_offer = AsyncMock(return_value="v=0\r\nfake sdp")
+        mock_pm.is_connected = MagicMock(return_value=True)
+
+        mock_cls = MagicMock(return_value=mock_pm)
+        mock_build = MagicMock(return_value="mock_rtc_config")
+        with patch.dict("sys.modules", {"src.common.peer": MagicMock(
+            PeerConnectionManager=mock_cls,
+            build_rtc_config=mock_build,
+        )}):
+            import src.consumer.client as mod
+            orig_build = mod.build_rtc_config
+            mod.build_rtc_config = mock_build
+            try:
+                await client._establish_p2p()
+            finally:
+                mod.build_rtc_config = orig_build
+
+            mock_build.assert_called_once_with(client._turn_servers)
+            mock_cls.assert_called_once()
+            call_kwargs = mock_cls.call_args
+            assert call_kwargs.kwargs.get("rtc_config") == "mock_rtc_config"
+
+    @pytest.mark.asyncio
+    async def test_establish_p2p_works_without_turn_servers(self):
+        client = _make_consumer_client()
+        client._turn_servers = None
+        client.pipeline = [{"node_id": "0xCCDD"}]
+
+        mock_pm = MagicMock()
+        mock_pm.create_offer = AsyncMock(return_value="v=0\r\nfake sdp")
+        mock_pm.is_connected = MagicMock(return_value=True)
+
+        mock_cls = MagicMock(return_value=mock_pm)
+        with patch.dict("sys.modules", {"src.common.peer": MagicMock(
+            PeerConnectionManager=mock_cls,
+        )}):
+            await client._establish_p2p()
+            call_kwargs = mock_cls.call_args
+            assert call_kwargs.kwargs.get("rtc_config") is None
+
+
+@pytest.mark.usefixtures("_mock_heavy_deps")
+class TestConsumerReconnectionMonitor:
+    """TASK 3: P2P reconnection with max 3 retries per peer."""
+
+    @pytest.mark.asyncio
+    async def test_monitor_detects_dropped_peer_and_reattempts(self):
+        client = _make_consumer_client()
+        node_id = "0xDEAD"
+        client.p2p_connected.add(node_id)
+        client.pipeline = [{"node_id": node_id}]
+
+        mock_pm = MagicMock()
+        is_connected_calls = [False]
+        mock_pm.is_connected = MagicMock(side_effect=lambda nid: is_connected_calls.pop(0) if is_connected_calls else True)
+        mock_pm.close = AsyncMock()
+        mock_pm.create_offer = AsyncMock(return_value="v=0\r\nreconnect sdp")
+        client.peer_manager = mock_pm
+
+        task = asyncio.create_task(client._monitor_p2p())
+        await asyncio.sleep(2.5)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        mock_pm.close.assert_called_with(node_id)
+        mock_pm.create_offer.assert_called_with(node_id)
+        assert client._reconnect_count >= 1
+
+    @pytest.mark.asyncio
+    async def test_max_reconnection_attempts(self):
+        client = _make_consumer_client()
+        node_id = "0xBEEF"
+        client.pipeline = [{"node_id": node_id}]
+        client._reconnect_attempts[node_id] = 3
+
+        mock_pm = MagicMock()
+        mock_pm.is_connected = MagicMock(return_value=False)
+        mock_pm.close = AsyncMock()
+        mock_pm.create_offer = AsyncMock(return_value="v=0\r\nsdp")
+        client.peer_manager = mock_pm
+
+        client.p2p_connected.add(node_id)
+        task = asyncio.create_task(client._monitor_p2p())
+        await asyncio.sleep(2.5)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        mock_pm.create_offer.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_monitor_cancelled_on_close(self):
+        client = _make_consumer_client()
+        client.pipeline = []
+        client._recv_task = None
+
+        client._p2p_monitor_task = asyncio.create_task(client._monitor_p2p())
+        await asyncio.sleep(0.1)
+        assert not client._p2p_monitor_task.done()
+
+        await client.close_session()
+        assert client._p2p_monitor_task is None
+
+
+@pytest.mark.usefixtures("_mock_heavy_deps")
+class TestNodeSdpReoffer:
+    """TASK 4: Node accepts re-offers for existing peers."""
+
+    @pytest.mark.asyncio
+    async def test_reoffer_replaces_old_connection(self):
+        from src.node.server import ComputeNodeServer
+
+        server = ComputeNodeServer(
+            model_name="test-model",
+            layer_start=0, layer_end=4,
+            device="cpu", legacy_mode=True,
+        )
+
+        mock_pm = MagicMock()
+        mock_pm.is_connected = MagicMock(return_value=True)
+        mock_pm.close = AsyncMock()
+        mock_pm.handle_offer = AsyncMock(return_value="v=0\r\nanswer sdp")
+        server.peer_manager = mock_pm
+
+        old_channel = MagicMock()
+        server.p2p_channels["0xPEER"] = old_channel
+
+        mock_ws = AsyncMock()
+
+        msg = {
+            "type": "sdp_offer",
+            "session_id": "sess-1",
+            "from_node_id": "0xPEER",
+            "sdp": "v=0\r\noffer sdp",
+        }
+
+        await server._handle_sdp_offer(mock_ws, msg)
+
+        mock_pm.close.assert_called_with("0xPEER")
+        mock_pm.handle_offer.assert_called_with("0xPEER", "v=0\r\noffer sdp")
+        assert "0xPEER" not in server.p2p_channels
+
+    @pytest.mark.asyncio
+    async def test_node_peer_state_monitor_cleans_up(self):
+        from src.node.server import ComputeNodeServer
+
+        server = ComputeNodeServer(
+            model_name="test-model",
+            layer_start=0, layer_end=4,
+            device="cpu", legacy_mode=True,
+        )
+
+        mock_pm = MagicMock()
+        mock_pm.is_connected = MagicMock(return_value=False)
+        server.peer_manager = mock_pm
+
+        server.p2p_channels["0xDROP"] = MagicMock()
+
+        task = asyncio.create_task(server._monitor_peer_state("0xDROP"))
+        await asyncio.sleep(2.5)
+        await task
+
+        assert "0xDROP" not in server.p2p_channels
+
+
+@pytest.mark.usefixtures("_mock_heavy_deps")
+class TestClientMetrics:
+    """TASK 5: P2P vs relay send counters and session stats."""
+
+    def test_initial_counters_zero(self):
+        client = _make_consumer_client()
+        assert client._p2p_send_count == 0
+        assert client._relay_send_count == 0
+        assert client._reconnect_count == 0
+
+    @pytest.mark.asyncio
+    async def test_relay_send_increments_counter(self):
+        client = _make_consumer_client()
+        client.pipeline = [{"node_id": "0xNODE"}]
+        client._recv_task = MagicMock()
+        client._recv_task.done = MagicMock(return_value=False)
+
+        async def mock_send(data):
+            for f in client._waiters.values():
+                if not f.done():
+                    f.set_result({"type": "activations", "seq_pos": 0})
+
+        client.relay_ws.send = mock_send
+
+        inner = {"seq_pos": 0, "type": "activations"}
+        try:
+            await asyncio.wait_for(
+                client._send_to_node("0xNODE", inner, timeout=1.0), timeout=2.0,
+            )
+        except Exception:
+            pass
+
+        assert client._relay_send_count >= 1
+        assert client._p2p_send_count == 0
+
+    @pytest.mark.asyncio
+    async def test_p2p_send_increments_counter(self):
+        client = _make_consumer_client()
+        node_id = "0xP2P"
+        client.p2p_connected.add(node_id)
+
+        mock_channel = MagicMock()
+        mock_channel.send_message = AsyncMock()
+        client.p2p_channels[node_id] = mock_channel
+
+        client._recv_task = MagicMock()
+        client._recv_task.done = MagicMock(return_value=False)
+
+        async def send_and_resolve():
+            inner = {"seq_pos": 7, "type": "activations"}
+            return await client._send_to_node(node_id, inner, timeout=1.0)
+
+        task = asyncio.create_task(send_and_resolve())
+        await asyncio.sleep(0.05)
+
+        if 7 in client._waiters:
+            client._waiters[7].set_result({"type": "activations", "seq_pos": 7})
+
+        try:
+            await asyncio.wait_for(task, timeout=2.0)
+        except Exception:
+            pass
+
+        assert client._p2p_send_count == 1

@@ -14,8 +14,12 @@ The relay is a pure router; it does not decode envelope payloads.
 
 import argparse
 import asyncio
+import base64
+import hashlib
+import hmac
 import json
 import logging
+import os
 import re
 import secrets
 import ssl
@@ -129,6 +133,10 @@ class ConsumerEntry:
     # M4 prep: per-node envelope counters for this session.
     envelope_counts: dict[str, int] = field(default_factory=dict)
     last_envelope_count: dict[str, int] = field(default_factory=dict)
+    # P2P connection metrics.
+    p2p_established: set[str] = field(default_factory=set)
+    p2p_failed: set[str] = field(default_factory=set)
+    connection_start_time: float = field(default_factory=time.time)
 
 
 class _RateLimiter:
@@ -196,6 +204,7 @@ class RelayNode:
         max_streams: int = 5000,
         max_message_size: int = 10 * 1024 * 1024,
         session_idle_timeout: float = 300.0,
+        turn_secret: str | None = None,
     ):
         self.host = host
         self.port = port
@@ -209,6 +218,7 @@ class RelayNode:
         self.max_streams = max_streams
         self.max_message_size = max_message_size
         self.session_idle_timeout = session_idle_timeout
+        self._turn_secret = turn_secret or os.environ.get("GROOVE_TURN_SECRET", "")
         self.nodes: dict[str, NodeEntry] = {}
         self.streams: dict[str, ConsumerEntry] = {}
         self.heartbeat_timeout = 120.0
@@ -216,6 +226,29 @@ class RelayNode:
         self._sched_lock = asyncio.Lock()
         self._connections_per_ip: dict[str, int] = {}
         self._node_streams: dict[str, set[str]] = {}
+
+    def _generate_turn_credentials(self, username: str, ttl: int = 86400) -> dict:
+        """Generate HMAC-based time-limited TURN credentials (coturn shared-secret model)."""
+        expiry = int(time.time()) + ttl
+        turn_username = f"{expiry}:{username}"
+        turn_password = base64.b64encode(
+            hmac.new(
+                self._turn_secret.encode(),
+                turn_username.encode(),
+                hashlib.sha1,
+            ).digest()
+        ).decode()
+        return {
+            "urls": ["turn:turn.groovedev.ai:3478"],
+            "username": turn_username,
+            "credential": turn_password,
+        }
+
+    def _get_turn_servers(self, username: str) -> list[dict] | None:
+        """Return TURN server list if secret is configured, else None."""
+        if not self._turn_secret:
+            return None
+        return [self._generate_turn_credentials(username)]
 
     def _active_assignments_for_model(self, model_name: str) -> dict[str, tuple[int, int]]:
         out: dict[str, tuple[int, int]] = {}
@@ -301,8 +334,26 @@ class RelayNode:
             return
 
         if t == P2P_READY:
+            peer_node_id = msg.get("peer_node_id")
+            if peer_node_id:
+                ce.p2p_established.add(peer_node_id)
+                elapsed = time.time() - ce.connection_start_time
+                logger.info(
+                    "p2p established",
+                    extra={
+                        "session_id": session_id,
+                        "node_id": from_node_id,
+                        "peer_node_id": peer_node_id,
+                        "elapsed_s": round(elapsed, 3),
+                    },
+                )
             await self._safe_send(ce.ws, encode_message(msg))
             return
+
+        if t == SDP_OFFER:
+            turn = self._get_turn_servers(from_node_id)
+            if turn:
+                msg["turn_servers"] = turn
 
         to_node_id = msg.get("to_node_id")
         target_node = self.nodes.get(to_node_id)
@@ -334,6 +385,10 @@ class RelayNode:
                 "signaling target node not available",
             )
             return
+        if msg.get("type") == SDP_OFFER:
+            turn = self._get_turn_servers(ce.session_id)
+            if turn:
+                msg["turn_servers"] = turn
         await self._safe_send(target.ws, encode_message(msg))
 
     async def _teardown_streams_using_node(self, node_id: str) -> None:
@@ -755,7 +810,11 @@ class RelayNode:
             {"node_id": n.node_id, "layer_start": n.layer_start, "layer_end": n.layer_end}
             for n in active
         ]
-        cfg = make_pipeline_config(session_id, nodes_payload, stream_id=stream_id)
+        turn_servers = self._get_turn_servers(session_id)
+        cfg = make_pipeline_config(
+            session_id, nodes_payload, stream_id=stream_id,
+            turn_servers=turn_servers,
+        )
         pipeline_ids = [n.node_id for n in active]
         ce = ConsumerEntry(
             stream_id=stream_id,
@@ -857,6 +916,10 @@ class RelayNode:
             self.streams.pop(stream_id, None)
             for nid in pipeline_ids:
                 self._node_streams.get(nid, set()).discard(stream_id)
+            total_nodes = len(ce.pipeline)
+            p2p_count = len(ce.p2p_established)
+            p2p_failed_count = len(ce.p2p_failed)
+            relay_only = total_nodes - p2p_count - p2p_failed_count
             logger.info(
                 "session closed",
                 extra={
@@ -865,6 +928,10 @@ class RelayNode:
                     "model": ce.model_name,
                     "envelope_counts": dict(ce.envelope_counts),
                     "duration_s": round(time.time() - ce.created_at, 3),
+                    "p2p_established": list(ce.p2p_established),
+                    "p2p_failed": list(ce.p2p_failed),
+                    "p2p_success_rate": round(p2p_count / total_nodes, 2) if total_nodes else 0,
+                    "relay_only_count": relay_only,
                 },
             )
 
@@ -1153,6 +1220,10 @@ async def main() -> None:
         help="Maximum WebSocket message size in bytes (default 10 MB)",
     )
     parser.add_argument(
+        "--turn-secret", default=None,
+        help="Shared secret for HMAC-based TURN credential generation (coturn)",
+    )
+    parser.add_argument(
         "--log-level", default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
     )
@@ -1169,6 +1240,7 @@ async def main() -> None:
         cors_origin=args.cors_origin,
         max_connections_per_ip=args.max_connections_per_ip,
         max_message_size=args.max_message_size,
+        turn_secret=args.turn_secret,
     )
     await relay.start()
 
