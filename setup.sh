@@ -243,11 +243,41 @@ install_deps() {
         fi
         return $(( 1 - torch_ok ))
     }
-    if ! install_torch; then
-        error "Failed to install PyTorch"
-        json_error "Failed to install PyTorch" "TORCH_INSTALL"
-        JSON_ERROR_EMITTED=1
-        exit 1
+
+    # Skip PyTorch install if already present and device matches.
+    local existing_device=""
+    existing_device=$("$PYTHON_CMD" -c "
+import torch
+if torch.cuda.is_available():
+    print('cuda')
+elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+    print('mps')
+else:
+    print('cpu')
+" 2>/dev/null || echo "")
+
+    local need_install=true
+    if [[ -n "$existing_device" ]]; then
+        if [[ "$gpu_type" == "cuda" && "$existing_device" == "cuda" ]]; then
+            need_install=false
+        elif [[ "$gpu_type" == "mps" && "$existing_device" == "mps" ]]; then
+            need_install=false
+        elif [[ "$gpu_type" == "macos-cpu" && -n "$existing_device" ]]; then
+            need_install=false
+        elif [[ "$gpu_type" == "cpu" && -n "$existing_device" ]]; then
+            need_install=false
+        fi
+    fi
+
+    if $need_install; then
+        if ! install_torch; then
+            error "Failed to install PyTorch"
+            json_error "Failed to install PyTorch" "TORCH_INSTALL"
+            JSON_ERROR_EMITTED=1
+            exit 1
+        fi
+    else
+        log "PyTorch already installed with $existing_device support — skipping"
     fi
     json_emit "installing-torch" "PyTorch installed" 75
 
