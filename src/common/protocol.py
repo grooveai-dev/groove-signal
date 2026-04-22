@@ -39,6 +39,12 @@ AUTH_RESPONSE = "auth_response"
 PIPELINE_MESH = "pipeline_mesh"
 KV_TRIM = "kv_trim"
 
+# WebRTC P2P signaling message types.
+SDP_OFFER = "sdp_offer"
+SDP_ANSWER = "sdp_answer"
+ICE_CANDIDATE = "ice_candidate"
+P2P_READY = "p2p_ready"
+
 # M3 signal-specific message types.
 SIGNAL_REGISTER = "signal_register"
 SIGNAL_ACK = "signal_ack"
@@ -54,6 +60,7 @@ ALL_MESSAGE_TYPES = frozenset({
     ASSIGN_LAYERS, ASSIGNMENT_ACK, REBALANCE,
     AUTH_CHALLENGE, AUTH_RESPONSE,
     PIPELINE_MESH, KV_TRIM,
+    SDP_OFFER, SDP_ANSWER, ICE_CANDIDATE, P2P_READY,
     SIGNAL_REGISTER, SIGNAL_ACK, SIGNAL_HEARTBEAT,
     SIGNAL_QUERY, SIGNAL_MATCH, SIGNAL_DEREGISTER,
 })
@@ -630,4 +637,70 @@ def make_kv_trim(
         "type": KV_TRIM,
         "session_id": session_id,
         "trim_count": int(trim_count),
+    }
+
+
+# ---------------------------------------------------------------------------
+# WebRTC P2P signaling factory functions.
+# ---------------------------------------------------------------------------
+
+def make_sdp_offer(
+    session_id: str,
+    from_node_id: str,
+    to_node_id: str,
+    sdp: str,
+) -> dict:
+    return {
+        "type": SDP_OFFER,
+        "session_id": session_id,
+        "from_node_id": from_node_id,
+        "to_node_id": to_node_id,
+        "sdp": sdp,
+    }
+
+
+def make_sdp_answer(
+    session_id: str,
+    from_node_id: str,
+    to_node_id: str,
+    sdp: str,
+) -> dict:
+    return {
+        "type": SDP_ANSWER,
+        "session_id": session_id,
+        "from_node_id": from_node_id,
+        "to_node_id": to_node_id,
+        "sdp": sdp,
+    }
+
+
+def make_ice_candidate(
+    session_id: str,
+    from_node_id: str,
+    to_node_id: str,
+    candidate: str,
+    sdp_mid: str,
+    sdp_m_line_index: int,
+) -> dict:
+    return {
+        "type": ICE_CANDIDATE,
+        "session_id": session_id,
+        "from_node_id": from_node_id,
+        "to_node_id": to_node_id,
+        "candidate": candidate,
+        "sdp_mid": sdp_mid,
+        "sdp_m_line_index": int(sdp_m_line_index),
+    }
+
+
+def make_p2p_ready(
+    session_id: str,
+    node_id: str,
+    peer_node_id: str,
+) -> dict:
+    return {
+        "type": P2P_READY,
+        "session_id": session_id,
+        "node_id": node_id,
+        "peer_node_id": peer_node_id,
     }

@@ -26,18 +26,24 @@ import websockets
 
 logger = logging.getLogger("consumer")
 
+from src.common.chunking import ChunkedChannel
 from src.common.protocol import (
     ACTIVATIONS,
     ENVELOPE,
     ERROR,
+    ICE_CANDIDATE,
     LOGITS,
+    P2P_READY,
     PIPELINE_CONFIG,
     PROTOCOL_VERSION,
+    SDP_ANSWER,
+    SDP_OFFER,
     VERIFY_RESULT,
     decode_message,
     encode_message,
     make_activations,
     make_envelope,
+    make_sdp_offer,
     make_session_init,
     new_session_id,
 )
@@ -91,6 +97,10 @@ class InferenceClient:
         self._generation_start: float = 0.0
         self._ttft_ms: float = 0.0
         self._first_token_emitted: bool = False
+
+        self.peer_manager = None
+        self.p2p_channels: dict[str, ChunkedChannel] = {}
+        self.p2p_connected: set[str] = set()
 
     def emit_event(self, event: dict) -> None:
         """Print one JSON event line to stdout. No-op when json_mode is off."""
@@ -182,7 +192,60 @@ class InferenceClient:
         })
 
         self._recv_task = asyncio.create_task(self._receive_loop())
+
+        await self._establish_p2p()
+
         return self.session_id
+
+    async def _establish_p2p(self) -> None:
+        """Attempt P2P WebRTC connections to all pipeline nodes."""
+        try:
+            from src.common.peer import PeerConnectionManager
+        except ImportError:
+            logger.info("P2P unavailable (peer.py not found), using relay")
+            return
+
+        self.peer_manager = PeerConnectionManager()
+        session_id = self.session_id or ""
+
+        for node in self.pipeline:
+            node_id = node["node_id"]
+            try:
+                offer_sdp = await self.peer_manager.create_offer(node_id)
+            except Exception:
+                logger.warning("failed to create SDP offer for %s", node_id[:12])
+                continue
+
+            offer_msg = make_sdp_offer(
+                session_id=session_id,
+                from_node_id="consumer",
+                to_node_id=node_id,
+                sdp=offer_sdp,
+            )
+            try:
+                await self.relay_ws.send(encode_message(offer_msg))
+            except (websockets.ConnectionClosed, OSError):
+                logger.warning("failed to send SDP offer for %s", node_id[:12])
+                continue
+
+        try:
+            await asyncio.wait_for(self._wait_for_p2p(), timeout=5.0)
+        except asyncio.TimeoutError:
+            missing = [
+                n["node_id"][:12] for n in self.pipeline
+                if n["node_id"] not in self.p2p_connected
+            ]
+            if missing:
+                logger.warning(
+                    "P2P timeout for %d node(s) (%s), using relay fallback",
+                    len(missing), ", ".join(missing),
+                )
+
+    async def _wait_for_p2p(self) -> None:
+        """Wait until all pipeline nodes are P2P-connected."""
+        expected = {n["node_id"] for n in self.pipeline}
+        while not expected.issubset(self.p2p_connected):
+            await asyncio.sleep(0.05)
 
     async def _receive_loop(self) -> None:
         try:
@@ -192,7 +255,29 @@ class InferenceClient:
                 try:
                     msg = decode_message(raw)
                 except Exception:
-                    logger.warning("failed to decode message from relay, skipping")
+                    try:
+                        msg = msgpack.unpackb(
+                            raw, raw=False,
+                            max_str_len=10 * 1024 * 1024,
+                            max_bin_len=10 * 1024 * 1024,
+                        )
+                    except Exception:
+                        logger.warning("failed to decode message from relay, skipping")
+                        continue
+                    if not isinstance(msg, dict) or "type" not in msg:
+                        logger.warning("failed to decode message from relay, skipping")
+                        continue
+
+                mtype = msg.get("type", "")
+
+                if mtype == SDP_ANSWER:
+                    await self._handle_sdp_answer(msg)
+                    continue
+                if mtype == ICE_CANDIDATE:
+                    await self._handle_ice_candidate(msg)
+                    continue
+                if mtype == P2P_READY:
+                    await self._handle_p2p_ready(msg)
                     continue
 
                 if msg["type"] == ENVELOPE:
@@ -249,6 +334,42 @@ class InferenceClient:
                     fut.set_exception(err)
             self._waiters.clear()
 
+    async def _handle_sdp_answer(self, msg: dict) -> None:
+        if self.peer_manager is None:
+            return
+        from_id = msg.get("from_node_id", "")
+        try:
+            await self.peer_manager.accept_answer(from_id, msg["sdp"])
+        except Exception:
+            logger.warning("failed to accept SDP answer from %s", from_id[:12])
+
+    async def _handle_ice_candidate(self, msg: dict) -> None:
+        if self.peer_manager is None:
+            return
+        from_id = msg.get("from_node_id", "")
+        try:
+            await self.peer_manager.add_ice_candidate(from_id, {
+                "candidate": msg.get("candidate", ""),
+                "sdpMid": msg.get("sdp_mid"),
+                "sdpMLineIndex": msg.get("sdp_m_line_index"),
+            })
+        except Exception:
+            logger.warning("failed to add ICE candidate from %s", from_id[:12])
+
+    async def _handle_p2p_ready(self, msg: dict) -> None:
+        node_id = msg.get("node_id") or msg.get("peer_node_id", "")
+        if not node_id:
+            return
+
+        if self.peer_manager is not None:
+            async def _p2p_send(data: bytes):
+                await self.peer_manager.send(node_id, data)
+
+            self.p2p_channels[node_id] = ChunkedChannel(_p2p_send)
+
+        self.p2p_connected.add(node_id)
+        logger.info("P2P channel ready with %s", node_id[:12])
+
     async def _send_to_node(
         self, node_id: str, inner: dict, timeout: float | None = None,
         stage_idx: int | None = None,
@@ -269,19 +390,38 @@ class InferenceClient:
         fut: asyncio.Future = loop.create_future()
         self._waiters[seq] = fut
 
-        self.envelope_count += 1
-        env = make_envelope(
-            self.stream_id,
-            msgpack.packb(inner, use_bin_type=True),
-            target_node_id=node_id,
-            envelope_count=self.envelope_count,
-        )
+        inner_bytes = msgpack.packb(inner, use_bin_type=True)
         rtt_start = time.perf_counter()
-        try:
-            await self.relay_ws.send(encode_message(env))
-        except Exception:
-            self._waiters.pop(seq, None)
-            raise
+
+        if node_id in self.p2p_connected and node_id in self.p2p_channels:
+            try:
+                await self.p2p_channels[node_id].send_message(inner_bytes)
+            except Exception:
+                logger.warning("P2P send to %s failed, falling back to relay", node_id[:12])
+                self.p2p_connected.discard(node_id)
+                self.envelope_count += 1
+                env = make_envelope(
+                    self.stream_id, inner_bytes,
+                    target_node_id=node_id,
+                    envelope_count=self.envelope_count,
+                )
+                try:
+                    await self.relay_ws.send(encode_message(env))
+                except Exception:
+                    self._waiters.pop(seq, None)
+                    raise
+        else:
+            self.envelope_count += 1
+            env = make_envelope(
+                self.stream_id, inner_bytes,
+                target_node_id=node_id,
+                envelope_count=self.envelope_count,
+            )
+            try:
+                await self.relay_ws.send(encode_message(env))
+            except Exception:
+                self._waiters.pop(seq, None)
+                raise
 
         try:
             result = await asyncio.wait_for(fut, timeout=timeout)
@@ -783,6 +923,14 @@ class InferenceClient:
             except Exception:
                 pass
             self.relay_ws = None
+        if self.peer_manager is not None:
+            try:
+                await self.peer_manager.close_all()
+            except Exception:
+                pass
+            self.peer_manager = None
+        self.p2p_channels.clear()
+        self.p2p_connected.clear()
         self.session_id = None
         self.stream_id = None
         self.pipeline = []

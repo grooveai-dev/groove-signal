@@ -37,12 +37,16 @@ from src.common.protocol import (
     ENVELOPE,
     ERROR,
     HEARTBEAT,
+    ICE_CANDIDATE,
     KV_TRIM,
+    P2P_READY,
     PIPELINE_CONFIG,
     PIPELINE_MESH,
     PROTOCOL_VERSION,
     REBALANCE,
     REGISTER_NODE,
+    SDP_ANSWER,
+    SDP_OFFER,
     SESSION_INIT,
     decode_message,
     encode_message,
@@ -225,6 +229,13 @@ class RelayNode:
                 out[nid] = (entry.layer_start, entry.layer_end)
         return out
 
+    def _find_consumer_by_session(self, session_id: str) -> ConsumerEntry | None:
+        """Look up a consumer entry by session_id."""
+        for ce in self.streams.values():
+            if ce.session_id == session_id:
+                return ce
+        return None
+
     def assemble_pipeline(self, model_name: str, session_id: str) -> list[NodeEntry]:
         active = [
             n for n in self.nodes.values()
@@ -260,6 +271,70 @@ class RelayNode:
             await ws.send(encode_message(make_error(session_id, code, message)))
         except (ConnectionClosed, OSError):
             pass
+
+    async def _forward_signaling(self, from_node_id: str, msg: dict) -> None:
+        """Forward a WebRTC signaling message from a node to its target."""
+        t = msg.get("type")
+        session_id = msg.get("session_id")
+
+        claimed = msg.get("from_node_id") or msg.get("node_id")
+        if claimed != from_node_id:
+            logger.warning(
+                "signaling sender mismatch",
+                extra={"claimed": claimed, "actual": from_node_id},
+            )
+            return
+
+        ce = self._find_consumer_by_session(session_id)
+        if ce is None:
+            logger.warning(
+                "signaling for unknown session",
+                extra={"type": t, "session_id": session_id, "node_id": from_node_id},
+            )
+            return
+
+        if from_node_id not in ce.pipeline:
+            logger.warning(
+                "signaling sender not in pipeline",
+                extra={"node_id": from_node_id, "session_id": session_id},
+            )
+            return
+
+        if t == P2P_READY:
+            await self._safe_send(ce.ws, encode_message(msg))
+            return
+
+        to_node_id = msg.get("to_node_id")
+        target_node = self.nodes.get(to_node_id)
+        if target_node is not None:
+            if to_node_id not in ce.pipeline:
+                logger.warning(
+                    "signaling target not in pipeline",
+                    extra={"to_node_id": to_node_id, "session_id": session_id},
+                )
+                return
+            await self._safe_send(target_node.ws, encode_message(msg))
+            return
+
+        await self._safe_send(ce.ws, encode_message(msg))
+
+    async def _forward_consumer_signaling(self, ce: ConsumerEntry, msg: dict) -> None:
+        """Forward a signaling message from a consumer to a pipeline node."""
+        to_node_id = msg.get("to_node_id")
+        if to_node_id not in ce.pipeline:
+            logger.warning(
+                "consumer signaling target not in pipeline",
+                extra={"stream_id": ce.stream_id, "to_node_id": to_node_id},
+            )
+            return
+        target = self.nodes.get(to_node_id)
+        if target is None or target.status != "active":
+            await self._send_error(
+                ce.ws, ce.session_id, "NODE_UNAVAILABLE",
+                "signaling target node not available",
+            )
+            return
+        await self._safe_send(target.ws, encode_message(msg))
 
     async def _teardown_streams_using_node(self, node_id: str) -> None:
         affected = [sid for sid, ce in self.streams.items() if node_id in ce.pipeline]
@@ -444,6 +519,8 @@ class RelayNode:
                     ce = self.streams.get(sid) if sid else None
                     if ce is not None:
                         await self._safe_send(ce.ws, encode_message(msg))
+                elif t in (SDP_OFFER, SDP_ANSWER, ICE_CANDIDATE, P2P_READY):
+                    await self._forward_signaling(node_id, msg)
                 elif t == DEREGISTER:
                     logger.info(
                         "node deregistered",
@@ -721,10 +798,14 @@ class RelayNode:
                     logger.exception("decode failed on consumer frame", extra={"stream_id": stream_id})
                     continue
 
-                if msg.get("type") != ENVELOPE:
+                t = msg.get("type")
+                if t in (SDP_OFFER, SDP_ANSWER, ICE_CANDIDATE):
+                    await self._forward_consumer_signaling(ce, msg)
+                    continue
+                if t != ENVELOPE:
                     await self._send_error(
                         ws, session_id, "BAD_FRAME",
-                        "expected envelope",
+                        "expected envelope or signaling message",
                     )
                     continue
 

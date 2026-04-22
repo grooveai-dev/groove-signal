@@ -37,9 +37,13 @@ from src.common.protocol import (
     AUTH_CHALLENGE,
     ENVELOPE,
     HEARTBEAT,
+    ICE_CANDIDATE,
+    P2P_READY,
     PROTOCOL_VERSION,
     REBALANCE,
     REGISTER_ACK,
+    SDP_ANSWER,
+    SDP_OFFER,
     SESSION_INIT,
     SPEC_WINDOW,
     decode_message,
@@ -53,9 +57,11 @@ from src.common.protocol import (
     make_heartbeat,
     make_logits,
     make_register_node,
+    make_sdp_answer,
     make_verify_result,
 )
 from src.common.benchmark import classify_node_role, run_node_benchmark
+from src.common.chunking import ChunkedChannel
 from src.common.tensor_transfer import deserialize_tensor, serialize_tensor
 from src.node.identity import derive_node_id, load_or_create_identity, sign_message
 from src.node.kv_cache import KVCacheManager
@@ -215,6 +221,11 @@ class ComputeNodeServer:
             concurrent.futures.ThreadPoolExecutor(max_workers=1)
             if self.device == "mps" else None
         )
+
+        self.peer_manager = None
+        self.upstream_peer: str | None = None
+        self.downstream_peer: str | None = None
+        self.p2p_channels: dict[str, ChunkedChannel] = {}
 
     async def load(self) -> None:
         if self.model_name is None or self.layer_start is None or self.layer_end is None:
@@ -423,6 +434,19 @@ class ComputeNodeServer:
                 await self._handle_rebalance(ws, frame)
                 continue
 
+            if ftype == SDP_OFFER:
+                await self._handle_sdp_offer(ws, frame)
+                continue
+            if ftype == SDP_ANSWER:
+                await self._handle_sdp_answer(frame)
+                continue
+            if ftype == ICE_CANDIDATE:
+                await self._handle_ice_candidate(frame)
+                continue
+            if ftype == P2P_READY:
+                await self._handle_p2p_ready(ws, frame)
+                continue
+
             if ftype != ENVELOPE:
                 logger.warning("non-envelope frame from relay: %s", ftype)
                 continue
@@ -470,15 +494,29 @@ class ComputeNodeServer:
             if response is None:
                 continue
 
-            outbound = make_envelope(
-                stream_id,
-                msgpack.packb(response, use_bin_type=True),
-                target_node_id=None,
-            )
-            try:
-                await ws.send(encode_message(outbound))
-            except (websockets.ConnectionClosed, OSError):
-                return
+            response_bytes = msgpack.packb(response, use_bin_type=True)
+
+            downstream = self.downstream_peer
+            if downstream and downstream in self.p2p_channels:
+                try:
+                    await self.p2p_channels[downstream].send_message(response_bytes)
+                except Exception:
+                    logger.warning("P2P send failed, falling back to relay")
+                    outbound = make_envelope(
+                        stream_id, response_bytes, target_node_id=None,
+                    )
+                    try:
+                        await ws.send(encode_message(outbound))
+                    except (websockets.ConnectionClosed, OSError):
+                        return
+            else:
+                outbound = make_envelope(
+                    stream_id, response_bytes, target_node_id=None,
+                )
+                try:
+                    await ws.send(encode_message(outbound))
+                except (websockets.ConnectionClosed, OSError):
+                    return
 
     async def _load_shard_async(self, model_name: str, layer_start: int, layer_end: int) -> dict:
         loop = asyncio.get_event_loop()
@@ -832,6 +870,87 @@ class ComputeNodeServer:
 
     def _handle_heartbeat(self, msg: dict) -> dict:
         return make_heartbeat(node_id=self.node_id, status="active")
+
+    def _get_peer_manager(self):
+        """Lazy-init PeerConnectionManager (backend agent's module)."""
+        if self.peer_manager is not None:
+            return self.peer_manager
+        try:
+            from src.common.peer import PeerConnectionManager
+        except ImportError:
+            logger.warning(
+                "src.common.peer not available — P2P disabled. "
+                "Install aiortc and ensure peer.py is present."
+            )
+            return None
+        self.peer_manager = PeerConnectionManager()
+        return self.peer_manager
+
+    async def _handle_sdp_offer(self, ws, msg: dict) -> None:
+        """Received via signal WS. Create answer, send back via signal."""
+        pm = self._get_peer_manager()
+        if pm is None:
+            return
+        from_id = msg.get("from_node_id", "")
+        try:
+            answer_sdp = await pm.handle_offer(from_id, msg["sdp"])
+        except Exception:
+            logger.exception("failed to handle SDP offer from %s", from_id[:12])
+            return
+
+        answer = make_sdp_answer(
+            session_id=msg.get("session_id", ""),
+            from_node_id=self.node_id,
+            to_node_id=from_id,
+            sdp=answer_sdp,
+        )
+        try:
+            await ws.send(encode_message(answer))
+        except (websockets.ConnectionClosed, OSError):
+            return
+
+        logger.info("SDP answer sent to %s", from_id[:12])
+
+    async def _handle_sdp_answer(self, msg: dict) -> None:
+        """Apply remote SDP answer to complete handshake."""
+        pm = self._get_peer_manager()
+        if pm is None:
+            return
+        from_id = msg.get("from_node_id", "")
+        try:
+            await pm.accept_answer(from_id, msg["sdp"])
+        except Exception:
+            logger.exception("failed to accept SDP answer from %s", from_id[:12])
+
+    async def _handle_ice_candidate(self, msg: dict) -> None:
+        """Add trickled ICE candidate to connection."""
+        pm = self._get_peer_manager()
+        if pm is None:
+            return
+        from_id = msg.get("from_node_id", "")
+        try:
+            await pm.add_ice_candidate(from_id, {
+                "candidate": msg.get("candidate", ""),
+                "sdpMid": msg.get("sdp_mid"),
+                "sdpMLineIndex": msg.get("sdp_m_line_index"),
+            })
+        except Exception:
+            logger.exception("failed to add ICE candidate from %s", from_id[:12])
+
+    async def _handle_p2p_ready(self, ws, msg: dict) -> None:
+        """Mark peer connection as ready, create ChunkedChannel wrapper."""
+        pm = self._get_peer_manager()
+        if pm is None:
+            return
+        peer_id = msg.get("node_id") or msg.get("peer_node_id", "")
+        if not peer_id:
+            return
+
+        async def _p2p_send(data: bytes):
+            await pm.send(peer_id, data)
+
+        self.p2p_channels[peer_id] = ChunkedChannel(_p2p_send)
+        logger.info("P2P channel ready with %s", peer_id[:12])
 
 
 def parse_layer_range(layer_str: str) -> tuple[int, int]:
