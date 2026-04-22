@@ -2,6 +2,9 @@
 
 Uses raw numpy byte buffers — no pickle (security), no torch.save (slow).
 Target: <1ms round-trip for 8KB tensors on local network.
+
+Wire format v2 adds an optional LZ4 compression flag byte:
+  compression_flag (uint8: 0x00=raw, 0x01=lz4) | original_payload
 """
 
 import io
@@ -10,10 +13,21 @@ import struct
 import numpy as np
 import torch
 
+try:
+    import lz4.frame as _lz4
+except ImportError:
+    _lz4 = None
+
 # Header: shape_ndim (uint8) | shape (ndim x int32) | dtype_len (uint8) | dtype_str | data
 _NDIM_FMT = "!B"
 _DIM_FMT = "!i"
 _DTYPE_LEN_FMT = "!B"
+
+_COMPRESS_FLAG_FMT = "!B"
+_COMPRESS_RAW = 0x00
+_COMPRESS_LZ4 = 0x01
+
+_COMPRESSION_THRESHOLD = 16 * 1024  # 16KB
 
 # Mapping between torch and numpy dtypes
 _TORCH_TO_NP = {
@@ -52,10 +66,11 @@ def _torch_to_numpy_safe(tensor: torch.Tensor) -> np.ndarray:
     return t.numpy()
 
 
-def serialize_tensor(tensor: torch.Tensor) -> bytes:
+def serialize_tensor(tensor: torch.Tensor, compress: bool = True) -> bytes:
     """Serialize a PyTorch tensor to a compact binary blob.
 
-    Format: ndim | shape dims | dtype string | raw data bytes
+    Format: compression_flag | ndim | shape dims | dtype string | raw data bytes
+    When compress=True and the payload exceeds 16KB, LZ4 is applied.
     """
     shape = tensor.shape
     dtype_str = _TORCH_TO_NP.get(tensor.dtype)
@@ -77,7 +92,13 @@ def serialize_tensor(tensor: torch.Tensor) -> bytes:
     buf.write(dtype_bytes)
     buf.write(arr.tobytes())
 
-    return buf.getvalue()
+    payload = buf.getvalue()
+
+    if compress and _lz4 is not None and len(payload) >= _COMPRESSION_THRESHOLD:
+        compressed = _lz4.compress(payload)
+        return struct.pack(_COMPRESS_FLAG_FMT, _COMPRESS_LZ4) + compressed
+    else:
+        return struct.pack(_COMPRESS_FLAG_FMT, _COMPRESS_RAW) + payload
 
 
 _MAX_TENSOR_NDIM = 8
@@ -87,9 +108,27 @@ _MAX_TENSOR_ELEMENTS = 100_000_000
 def deserialize_tensor(data: bytes, device: str = "cpu") -> torch.Tensor:
     """Reconstruct a PyTorch tensor from a binary blob.
 
+    Supports both v1 (no compression flag) and v2 (compression flag) formats.
     Validates shape, dtype, and data length to prevent OOM, crashes,
     or unexpected behavior from malicious payloads.
     """
+    if len(data) < 2:
+        raise ValueError("tensor data too short")
+
+    flag_byte = data[0]
+    if flag_byte in (_COMPRESS_RAW, _COMPRESS_LZ4):
+        payload_data = data[1:]
+        if flag_byte == _COMPRESS_LZ4:
+            if _lz4 is None:
+                raise RuntimeError("lz4 not installed but received LZ4-compressed tensor")
+            payload_data = _lz4.decompress(payload_data)
+    else:
+        payload_data = data
+
+    return _deserialize_payload(payload_data, device)
+
+
+def _deserialize_payload(data: bytes, device: str = "cpu") -> torch.Tensor:
     offset = 0
 
     (ndim,) = struct.unpack_from(_NDIM_FMT, data, offset)

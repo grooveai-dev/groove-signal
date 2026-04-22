@@ -29,7 +29,7 @@ from src.relay.relay import RelayNode
 from src.relay.scheduler import MODEL_REGISTRY
 
 
-MODEL = "Qwen/Qwen2.5-0.5B"
+MODEL = next(iter(MODEL_REGISTRY))
 TOTAL = MODEL_REGISTRY[MODEL]["total_layers"]
 
 
@@ -121,10 +121,12 @@ async def test_dynamic_two_nodes_trigger_rebalance():
         nid_a = "0x" + "a" * 40
         nid_b = "0x" + "b" * 40
 
+        # Use limited RAM so minimize_hops must split across both nodes.
+        node_ram = 6000
         ws_a = await websockets.connect(f"ws://127.0.0.1:{port}", max_size=1 << 20)
         await ws_a.send(encode_message(make_register_node(
             nid_a, layer_start=None, layer_end=None,
-            capabilities={"ram_mb": 16000, "device": "cpu"},
+            capabilities={"ram_mb": node_ram, "device": "cpu"},
         )))
         ack_a = await _recv(ws_a)
         assert ack_a["accepted"]
@@ -143,7 +145,7 @@ async def test_dynamic_two_nodes_trigger_rebalance():
         ws_b = await websockets.connect(f"ws://127.0.0.1:{port}", max_size=1 << 20)
         await ws_b.send(encode_message(make_register_node(
             nid_b, layer_start=None, layer_end=None,
-            capabilities={"ram_mb": 16000, "device": "cpu"},
+            capabilities={"ram_mb": node_ram, "device": "cpu"},
         )))
         ack_b = await _recv(ws_b)
         assert ack_b["accepted"]

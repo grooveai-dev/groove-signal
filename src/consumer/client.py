@@ -85,6 +85,12 @@ class InferenceClient:
         self._node_gone: bool = False
         self.max_retries: int = 3
         self.node_timeout: float = node_timeout
+        self.timing_stats: dict = {}
+        self._stage_times: dict[int, list[float]] = {}
+        self._stage_forward_times: dict[int, list[float]] = {}
+        self._generation_start: float = 0.0
+        self._ttft_ms: float = 0.0
+        self._first_token_emitted: bool = False
 
     def emit_event(self, event: dict) -> None:
         """Print one JSON event line to stdout. No-op when json_mode is off."""
@@ -245,6 +251,7 @@ class InferenceClient:
 
     async def _send_to_node(
         self, node_id: str, inner: dict, timeout: float | None = None,
+        stage_idx: int | None = None,
     ) -> dict:
         if timeout is None:
             timeout = self.node_timeout
@@ -269,6 +276,7 @@ class InferenceClient:
             target_node_id=node_id,
             envelope_count=self.envelope_count,
         )
+        rtt_start = time.perf_counter()
         try:
             await self.relay_ws.send(encode_message(env))
         except Exception:
@@ -276,13 +284,22 @@ class InferenceClient:
             raise
 
         try:
-            return await asyncio.wait_for(fut, timeout=timeout)
+            result = await asyncio.wait_for(fut, timeout=timeout)
         except asyncio.TimeoutError:
             self._waiters.pop(seq, None)
             raise RuntimeError(
                 f"Pipeline node {node_id[:10]}… did not respond within "
                 f"{timeout}s (seq_pos={seq})"
             )
+
+        rtt_ms = (time.perf_counter() - rtt_start) * 1000.0
+        if stage_idx is not None:
+            self._stage_times.setdefault(stage_idx, []).append(rtt_ms)
+            fwd = result.get("forward_ms")
+            if isinstance(fwd, (int, float)) and fwd > 0:
+                self._stage_forward_times.setdefault(stage_idx, []).append(float(fwd))
+
+        return result
 
     async def send_to_pipeline(self, message: dict) -> dict:
         """Forward a message through every node in pipeline order.
@@ -336,8 +353,8 @@ class InferenceClient:
     async def _send_through_stages(self, message: dict) -> dict:
         """Send a single message through all pipeline stages serially."""
         msg = message
-        for node in self.pipeline:
-            response = await self._send_to_node(node["node_id"], msg)
+        for idx, node in enumerate(self.pipeline):
+            response = await self._send_to_node(node["node_id"], msg, stage_idx=idx)
             t = response.get("type")
             if t in (LOGITS, VERIFY_RESULT, ERROR):
                 return response
@@ -541,6 +558,30 @@ class InferenceClient:
 
         return last_response
 
+    def _finalize_timing(self) -> dict:
+        """Build a JSON timing breakdown from collected stage times."""
+        stats: dict = {}
+        total_rtt_ms = 0.0
+        total_compute_ms = 0.0
+        for stage_idx, times in sorted(self._stage_times.items()):
+            avg = sum(times) / len(times) if times else 0.0
+            stats[f"stage_{stage_idx}_avg_ms"] = round(avg, 2)
+            stats[f"stage_{stage_idx}_count"] = len(times)
+            total_rtt_ms += sum(times)
+            fwd_times = self._stage_forward_times.get(stage_idx, [])
+            total_compute_ms += sum(fwd_times)
+        stats["total_network_ms"] = round(total_rtt_ms - total_compute_ms, 2)
+        stats["total_compute_ms"] = round(total_compute_ms, 2)
+        stats["ttft_ms"] = round(self._ttft_ms, 2)
+        gen_elapsed = (time.perf_counter() - self._generation_start) * 1000.0 if self._generation_start else 0
+        stats["tokens_generated"] = self.tokens_generated
+        if gen_elapsed > 0 and self.tokens_generated > 0:
+            stats["tps"] = round(self.tokens_generated / (gen_elapsed / 1000.0), 2)
+        else:
+            stats["tps"] = 0.0
+        self.timing_stats = stats
+        return stats
+
     async def _autoregressive_generate(
         self,
         input_ids: list[int],
@@ -552,6 +593,11 @@ class InferenceClient:
         eos_id = self.tokenizer.eos_token_id
         use_pipeline = len(self.pipeline) > 1
 
+        self._generation_start = time.perf_counter()
+        self._stage_times.clear()
+        self._stage_forward_times.clear()
+        self._first_token_emitted = False
+
         response = await self._prefill_pipelined(input_ids)
         if response.get("type") == ERROR:
             raise RuntimeError(f"Pipeline error: {response.get('message', '')}")
@@ -561,6 +607,8 @@ class InferenceClient:
             _last_token_logits(logits), temperature, top_p
         )
         generated.append(next_token)
+        self._ttft_ms = (time.perf_counter() - self._generation_start) * 1000.0
+        self._first_token_emitted = True
         yield self.tokenizer.decode([next_token], skip_special_tokens=True)
 
         if use_pipeline:
@@ -593,6 +641,10 @@ class InferenceClient:
                 )
                 generated.append(next_token)
                 yield self.tokenizer.decode([next_token], skip_special_tokens=True)
+
+        timing = self._finalize_timing()
+        logger.info("generation timing: %s", json.dumps(timing))
+        self.emit_event({"type": "timing", **timing})
 
     async def _pipelined_token_generate(
         self,
@@ -632,7 +684,9 @@ class InferenceClient:
                         await out_q.put(_SENTINEL)
                         return
                     msg, seq_idx = item
-                    response = await self._send_to_node(node["node_id"], msg)
+                    response = await self._send_to_node(
+                        node["node_id"], msg, stage_idx=idx,
+                    )
                     t = response.get("type")
                     if t in (LOGITS, VERIFY_RESULT, ERROR):
                         await out_q.put((response, seq_idx))

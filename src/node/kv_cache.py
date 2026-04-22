@@ -5,9 +5,12 @@ keyed by session_id. Wraps transformers DynamicCache with session
 management (TTL cleanup, context limits).
 """
 
+import logging
 import time
 
 from transformers import DynamicCache
+
+logger = logging.getLogger(__name__)
 
 
 class SessionKVCache:
@@ -76,6 +79,20 @@ class KVCacheManager:
         for sid in expired:
             self.remove_session(sid)
         return expired
+
+    def trim(self, session_id: str, count: int) -> None:
+        session = self._sessions.get(session_id)
+        if session is None:
+            logger.warning("trim requested for unknown session %s", session_id)
+            return
+        if count <= 0:
+            return
+        cache = session.cache
+        seq_len = cache.get_seq_length()
+        if seq_len == 0:
+            return
+        keep = max(0, seq_len - count)
+        cache.crop(keep)
 
     @property
     def active_sessions(self) -> list[str]:

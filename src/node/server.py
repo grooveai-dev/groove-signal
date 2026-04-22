@@ -55,6 +55,7 @@ from src.common.protocol import (
     make_register_node,
     make_verify_result,
 )
+from src.common.benchmark import classify_node_role, run_node_benchmark
 from src.common.tensor_transfer import deserialize_tensor, serialize_tensor
 from src.node.identity import derive_node_id, load_or_create_identity, sign_message
 from src.node.kv_cache import KVCacheManager
@@ -71,6 +72,7 @@ def _capabilities(
     max_context: int,
     loaded_layers: tuple[int, int] | None = None,
     model_preferences: list[str] | None = None,
+    bench_data: dict | None = None,
 ) -> dict:
     try:
         import psutil
@@ -141,6 +143,10 @@ def _capabilities(
     if loaded_layers is not None:
         caps["layer_start"] = loaded_layers[0]
         caps["layer_end"] = loaded_layers[1]
+    if bench_data:
+        caps["bench_ms_per_layer"] = bench_data.get("bench_ms_per_layer", 0.0)
+        caps["bench_mem_bandwidth_gbps"] = bench_data.get("bench_mem_bandwidth_gbps", 0.0)
+        caps["node_role"] = bench_data.get("node_role", "writer")
     return caps
 
 
@@ -193,6 +199,7 @@ class ComputeNodeServer:
 
         self.shard: dict | None = None
         self.kv_manager = KVCacheManager()
+        self.bench_data: dict | None = None
 
         if node_id is not None:
             self.node_id = node_id
@@ -241,6 +248,21 @@ class ComputeNodeServer:
 
     async def run(self, relay_url: str, use_tls: bool = False) -> None:
         """Main loop: connect to relay with backoff, register, serve until stop."""
+        if self.bench_data is None:
+            from src.relay.scheduler import MODEL_REGISTRY
+            hidden_size = 2560
+            if self.model_name and self.model_name in MODEL_REGISTRY:
+                hidden_size = MODEL_REGISTRY[self.model_name].get("hidden_size", 2560)
+            loop = asyncio.get_event_loop()
+            self.bench_data = await loop.run_in_executor(
+                None, lambda: run_node_benchmark(hidden_size=hidden_size, device=self.device)
+            )
+            self.bench_data["node_role"] = classify_node_role(
+                self.bench_data.get("bench_ms_per_layer", 0.0),
+                self.bench_data.get("bench_mem_bandwidth_gbps", 0.0),
+                device=self.device,
+            )
+
         if self.legacy_mode:
             await self.load()
 
@@ -312,6 +334,7 @@ class ComputeNodeServer:
                 self.max_context,
                 loaded_layers=loaded,
                 model_preferences=self.model_preferences,
+                bench_data=self.bench_data,
             ),
             public_key=public_key,
         )
@@ -373,6 +396,7 @@ class ComputeNodeServer:
                     self.max_context,
                     loaded_layers=loaded,
                     model_preferences=self.model_preferences,
+                    bench_data=self.bench_data,
                 ),
             )
             try:
@@ -646,6 +670,7 @@ class ComputeNodeServer:
         return make_heartbeat(self.node_id, status="session_ready")
 
     async def _handle_activations(self, msg: dict) -> dict:
+        queue_start = time.perf_counter()
         if self.shard is None:
             err = make_error(
                 msg.get("session_id", ""), 409,
@@ -675,10 +700,15 @@ class ComputeNodeServer:
             session_cache = self.kv_manager.create_session(session_id, num_layers, self.max_context)
         kv_cache = session_cache.get_cache()
 
+        queue_ms = (time.perf_counter() - queue_start) * 1000.0
+        forward_start = time.perf_counter()
+
         loop = asyncio.get_event_loop()
         output, kv_cache = await loop.run_in_executor(
             self._inference_executor, lambda: forward_shard(self.shard, hidden_states, kv_cache=kv_cache)
         )
+
+        forward_ms = (time.perf_counter() - forward_start) * 1000.0
 
         is_last_shard = self.shard["lm_head"] is not None
         output_bytes = serialize_tensor(output)
@@ -691,6 +721,8 @@ class ComputeNodeServer:
                 logits_bytes=output_bytes,
                 shape=tuple(output.shape),
                 dtype=dtype,
+                forward_ms=round(forward_ms, 2),
+                queue_ms=round(queue_ms, 2),
             )
         return make_activations(
             session_id=session_id,
@@ -698,6 +730,8 @@ class ComputeNodeServer:
             hidden_states_bytes=output_bytes,
             shape=tuple(output.shape),
             dtype=dtype,
+            forward_ms=round(forward_ms, 2),
+            queue_ms=round(queue_ms, 2),
         )
 
     @torch.inference_mode()
@@ -768,10 +802,8 @@ class ComputeNodeServer:
 
         if num_accepted < num_candidates:
             trim_count = num_candidates - num_accepted
-            for layer_idx in range(len(kv_cache.key_cache)):
-                if kv_cache.key_cache[layer_idx].numel() > 0:
-                    kv_cache.key_cache[layer_idx] = kv_cache.key_cache[layer_idx][:, :, :-trim_count, :]
-                    kv_cache.value_cache[layer_idx] = kv_cache.value_cache[layer_idx][:, :, :-trim_count, :]
+            keep = max(0, kv_cache.get_seq_length() - trim_count)
+            kv_cache.crop(keep)
 
         result = make_verify_result(
             session_id=session_id,

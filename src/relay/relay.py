@@ -37,7 +37,9 @@ from src.common.protocol import (
     ENVELOPE,
     ERROR,
     HEARTBEAT,
+    KV_TRIM,
     PIPELINE_CONFIG,
+    PIPELINE_MESH,
     PROTOCOL_VERSION,
     REBALANCE,
     REGISTER_NODE,
@@ -58,6 +60,7 @@ from src.relay.scheduler import (
     assign_layers,
     calculate_rebalance,
     get_model_info,
+    minimize_hops_assign,
     validate_coverage,
 )
 
@@ -436,6 +439,11 @@ class RelayNode:
                         self.streams.pop(sid, None)
                 elif t == ASSIGNMENT_ACK:
                     self._handle_assignment_ack(entry, msg)
+                elif t in (PIPELINE_MESH, KV_TRIM):
+                    sid = msg.get("stream_id") or msg.get("session_id")
+                    ce = self.streams.get(sid) if sid else None
+                    if ce is not None:
+                        await self._safe_send(ce.ws, encode_message(msg))
                 elif t == DEREGISTER:
                     logger.info(
                         "node deregistered",

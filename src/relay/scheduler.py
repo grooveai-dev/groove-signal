@@ -6,6 +6,7 @@ consensus layer without modification.
 
 Inputs are plain dicts describing node capabilities; outputs are plain
 {node_id: (layer_start, layer_end_exclusive)} mappings.
+
 """
 
 from __future__ import annotations
@@ -64,21 +65,99 @@ def _effective_capacity_mb(node: dict) -> float:
     return ram * 0.5
 
 
-def assign_layers(
+def _inference_speed_score(node: dict) -> float:
+    """Lower is faster. Uses bench_ms_per_layer if available, else heuristic."""
+    bench = node.get("bench_ms_per_layer")
+    if isinstance(bench, (int, float)) and bench > 0:
+        return float(bench)
+    device = (node.get("device") or "cpu").lower()
+    if device in ("cuda", "gpu", "rocm"):
+        return 2.0
+    if device == "mps":
+        return 5.0
+    return 20.0
+
+
+def minimize_hops_assign(
     nodes_capabilities: list[dict],
     model_name: str,
 ) -> dict[str, tuple[int, int]]:
-    """Assign contiguous layer ranges to nodes proportional to capacity.
+    """Assign layers to the fewest, fastest nodes possible.
+
+    Sorts nodes by inference speed, greedily assigns max layers to the
+    fastest node first, only spills to the next node when memory is full.
+    Pipeline ordering puts the best 'reader' node first (prefill-heavy).
+    """
+    info = get_model_info(model_name)
+    total_layers: int = info["total_layers"]
+    mem_per_layer: float = info.get("memory_per_layer_mb", 0)
+
+    if not nodes_capabilities:
+        raise ValueError("Cannot assign layers with no nodes")
+
+    sorted_nodes = sorted(nodes_capabilities, key=_inference_speed_score)
+
+    selected: list[tuple[dict, int]] = []
+    remaining = total_layers
+
+    for node in sorted_nodes:
+        if remaining <= 0:
+            break
+        cap_mb = _effective_capacity_mb(node)
+        if mem_per_layer > 0 and cap_mb > 0:
+            max_layers = int(cap_mb / mem_per_layer)
+            max_layers = max(max_layers, 1)
+        else:
+            max_layers = remaining
+        count = min(max_layers, remaining)
+        selected.append((node, count))
+        remaining -= count
+
+    if remaining > 0:
+        if selected:
+            node, count = selected[-1]
+            selected[-1] = (node, count + remaining)
+        else:
+            raise ValueError("Cannot assign layers — no viable nodes")
+
+    def _reader_score(item: tuple[dict, int]) -> float:
+        node = item[0]
+        role = node.get("node_role", "")
+        if role == "reader":
+            return 0.0
+        bench = node.get("bench_ms_per_layer")
+        if isinstance(bench, (int, float)) and bench > 0:
+            return float(bench)
+        return 10.0
+
+    selected.sort(key=_reader_score)
+
+    assignments: dict[str, tuple[int, int]] = {}
+    cursor = 0
+    for node, count in selected:
+        nid = node["node_id"]
+        assignments[nid] = (cursor, cursor + count)
+        cursor += count
+    return assignments
+
+
+def assign_layers(
+    nodes_capabilities: list[dict],
+    model_name: str,
+    strategy: str = "minimize_hops",
+) -> dict[str, tuple[int, int]]:
+    """Assign contiguous layer ranges to nodes.
+
+    Strategies:
+      - 'minimize_hops' (default): pack onto fewest, fastest nodes
+      - 'proportional': spread across all nodes by capacity
 
     Returns {node_id: (layer_start, layer_end_exclusive)} covering
-    [0, total_layers) with no gaps or overlaps. Each participating node
-    receives at least one layer. Nodes are ordered by capacity descending
-    so the largest node serves the earliest layers (typically slightly
-    heavier due to embedding-adjacent compute).
-
-    Raises ValueError for unknown models, empty input, or models with
-    fewer layers than nodes (cannot give every node ≥1 layer).
+    [0, total_layers) with no gaps or overlaps.
     """
+    if strategy == "minimize_hops":
+        return minimize_hops_assign(nodes_capabilities, model_name)
+
     info = get_model_info(model_name)
     total_layers: int = info["total_layers"]
 
@@ -162,6 +241,7 @@ def calculate_rebalance(
     current_assignments: dict[str, tuple[int, int]],
     new_node_capabilities: list[dict],
     model_name: str,
+    strategy: str = "minimize_hops",
 ) -> tuple[dict[str, tuple[int, int]], list[str]]:
     """Compute a new assignment for the union of current + new nodes.
 
@@ -180,7 +260,7 @@ def calculate_rebalance(
         nid = caps["node_id"]
         by_id[nid] = dict(caps)
 
-    new_assignments = assign_layers(list(by_id.values()), model_name)
+    new_assignments = assign_layers(list(by_id.values()), model_name, strategy=strategy)
 
     affected: list[str] = []
     all_ids = set(new_assignments) | set(current_assignments)

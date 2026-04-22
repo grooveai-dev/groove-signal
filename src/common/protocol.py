@@ -6,6 +6,8 @@ outbound websocket to the relay; consumers maintain one websocket to the
 relay. The relay alone knows node addresses.
 """
 
+from __future__ import annotations
+
 import re
 import struct
 import time
@@ -34,6 +36,8 @@ ASSIGNMENT_ACK = "assignment_ack"
 REBALANCE = "rebalance"
 AUTH_CHALLENGE = "auth_challenge"
 AUTH_RESPONSE = "auth_response"
+PIPELINE_MESH = "pipeline_mesh"
+KV_TRIM = "kv_trim"
 
 # M3 signal-specific message types.
 SIGNAL_REGISTER = "signal_register"
@@ -49,6 +53,7 @@ ALL_MESSAGE_TYPES = frozenset({
     REGISTER_NODE, REGISTER_ACK, DEREGISTER, ENVELOPE,
     ASSIGN_LAYERS, ASSIGNMENT_ACK, REBALANCE,
     AUTH_CHALLENGE, AUTH_RESPONSE,
+    PIPELINE_MESH, KV_TRIM,
     SIGNAL_REGISTER, SIGNAL_ACK, SIGNAL_HEARTBEAT,
     SIGNAL_QUERY, SIGNAL_MATCH, SIGNAL_DEREGISTER,
 })
@@ -69,6 +74,7 @@ CAPABILITY_DEFAULTS = {
 CAPABILITY_KEYS = frozenset(CAPABILITY_DEFAULTS.keys()) | frozenset({
     "models_loaded", "model_preferences", "protocol_version",
     "layer_start", "layer_end", "load",
+    "bench_ms_per_layer", "bench_mem_bandwidth_gbps", "node_role",
 })
 
 NODE_ID_RE = re.compile(r'^0x[0-9a-fA-F]{40}$')
@@ -188,8 +194,9 @@ def make_session_init(
     layer_end: int,
     config: dict | None = None,
     protocol_version: int = PROTOCOL_VERSION,
+    grammar_mode: str | None = None,
 ) -> dict:
-    return {
+    msg = {
         "type": SESSION_INIT,
         "protocol_version": protocol_version,
         "session_id": session_id,
@@ -198,6 +205,9 @@ def make_session_init(
         "layer_end": layer_end,
         "config": config or {},
     }
+    if grammar_mode is not None:
+        msg["grammar_mode"] = grammar_mode
+    return msg
 
 
 def make_activations(
@@ -206,8 +216,10 @@ def make_activations(
     hidden_states_bytes: bytes,
     shape: tuple,
     dtype: str,
+    forward_ms: float | None = None,
+    queue_ms: float | None = None,
 ) -> dict:
-    return {
+    msg = {
         "type": ACTIVATIONS,
         "session_id": session_id,
         "seq_pos": seq_pos,
@@ -215,6 +227,11 @@ def make_activations(
         "shape": list(shape),
         "dtype": dtype,
     }
+    if forward_ms is not None:
+        msg["forward_ms"] = forward_ms
+    if queue_ms is not None:
+        msg["queue_ms"] = queue_ms
+    return msg
 
 
 def make_logits(
@@ -223,8 +240,10 @@ def make_logits(
     logits_bytes: bytes,
     shape: tuple,
     dtype: str,
+    forward_ms: float | None = None,
+    queue_ms: float | None = None,
 ) -> dict:
-    return {
+    msg = {
         "type": LOGITS,
         "session_id": session_id,
         "seq_pos": seq_pos,
@@ -232,6 +251,11 @@ def make_logits(
         "shape": list(shape),
         "dtype": dtype,
     }
+    if forward_ms is not None:
+        msg["forward_ms"] = forward_ms
+    if queue_ms is not None:
+        msg["queue_ms"] = queue_ms
+    return msg
 
 
 def make_spec_window(
@@ -572,4 +596,38 @@ def make_signal_deregister(node_id: str, reason: str = "") -> dict:
         "type": SIGNAL_DEREGISTER,
         "node_id": node_id,
         "reason": reason,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Pipeline mesh and KV management messages (prep for Phase 2).
+# ---------------------------------------------------------------------------
+
+def make_pipeline_mesh(
+    session_id: str,
+    nodes: list[dict],
+    consumer: dict | None = None,
+) -> dict:
+    """Direct P2P mesh topology for a session.
+
+    nodes: [{node_id, host, port, position}]
+    consumer: {host, port}
+    """
+    return {
+        "type": PIPELINE_MESH,
+        "session_id": session_id,
+        "nodes": nodes,
+        "consumer": consumer or {},
+    }
+
+
+def make_kv_trim(
+    session_id: str,
+    trim_count: int,
+) -> dict:
+    """Request KV cache trimming for rejected speculative tokens."""
+    return {
+        "type": KV_TRIM,
+        "session_id": session_id,
+        "trim_count": int(trim_count),
     }
