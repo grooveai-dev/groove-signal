@@ -7,7 +7,7 @@ transitions.
 """
 
 import asyncio
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -106,7 +106,8 @@ async def test_assign_layers_loads_shard_and_acks():
     server = _make_server()
     ws = _FakeWS()
 
-    with patch("src.node.server.load_model_shard", return_value=_fake_shard(0, 15)) as loader:
+    loader = AsyncMock(return_value=_fake_shard(0, 15))
+    with patch.object(server, "_load_shard_async", loader):
         ws.push({
             "type": ASSIGN_LAYERS,
             "model_name": "Qwen/Qwen2.5-0.5B",
@@ -134,9 +135,9 @@ async def test_assign_layers_rejects_on_load_error():
     server = _make_server()
     ws = _FakeWS()
 
-    with patch(
-        "src.node.server.load_model_shard",
-        side_effect=MemoryError("not enough RAM"),
+    with patch.object(
+        server, "_load_shard_async",
+        AsyncMock(side_effect=MemoryError("not enough RAM")),
     ):
         ws.push({
             "type": ASSIGN_LAYERS,
@@ -161,10 +162,8 @@ async def test_rebalance_swaps_shard():
     server.layer_end = 15
     ws = _FakeWS()
 
-    with patch(
-        "src.node.server.load_model_shard",
-        return_value=_fake_shard(16, 31),
-    ) as loader:
+    loader = AsyncMock(return_value=_fake_shard(16, 31))
+    with patch.object(server, "_load_shard_async", loader):
         ws.push({
             "type": REBALANCE,
             "node_id": server.node_id,
