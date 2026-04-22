@@ -43,6 +43,14 @@ ASSIGNMENT_ACK = "assignment_ack"
 REBALANCE = "rebalance"
 AUTH_CHALLENGE = "auth_challenge"
 AUTH_RESPONSE = "auth_response"
+PIPELINE_MESH = "pipeline_mesh"
+KV_TRIM = "kv_trim"
+
+# WebRTC P2P signaling message types.
+SDP_OFFER = "sdp_offer"
+SDP_ANSWER = "sdp_answer"
+ICE_CANDIDATE = "ice_candidate"
+P2P_READY = "p2p_ready"
 
 # ---------------------------------------------------------------------------
 # M3 signal-specific message types.
@@ -60,6 +68,8 @@ ALL_MESSAGE_TYPES = frozenset({
     REGISTER_NODE, REGISTER_ACK, DEREGISTER, ENVELOPE,
     ASSIGN_LAYERS, ASSIGNMENT_ACK, REBALANCE,
     AUTH_CHALLENGE, AUTH_RESPONSE,
+    PIPELINE_MESH, KV_TRIM,
+    SDP_OFFER, SDP_ANSWER, ICE_CANDIDATE, P2P_READY,
     SIGNAL_REGISTER, SIGNAL_ACK, SIGNAL_HEARTBEAT,
     SIGNAL_QUERY, SIGNAL_MATCH, SIGNAL_DEREGISTER,
 })
@@ -80,6 +90,7 @@ CAPABILITY_DEFAULTS = {
 CAPABILITY_KEYS = frozenset(CAPABILITY_DEFAULTS.keys()) | frozenset({
     "models_loaded", "model_preferences", "protocol_version",
     "layer_start", "layer_end", "load",
+    "bench_ms_per_layer", "bench_mem_bandwidth_gbps", "node_role",
 })
 
 NODE_ID_RE = re.compile(r'^0x[0-9a-fA-F]{40}$')
@@ -291,6 +302,7 @@ def make_pipeline_config(
     nodes: list[dict],
     stream_id: str | None = None,
     protocol_version: int = PROTOCOL_VERSION,
+    turn_servers: list[dict] | None = None,
 ) -> dict:
     msg = {
         "type": PIPELINE_CONFIG,
@@ -300,6 +312,8 @@ def make_pipeline_config(
     }
     if stream_id is not None:
         msg["stream_id"] = stream_id
+    if turn_servers:
+        msg["turn_servers"] = turn_servers
     return msg
 
 
@@ -573,4 +587,98 @@ def make_signal_deregister(node_id: str, reason: str = "") -> dict:
         "type": SIGNAL_DEREGISTER,
         "node_id": node_id,
         "reason": reason,
+    }
+
+
+# ---------------------------------------------------------------------------
+# WebRTC P2P signaling factory functions.
+# ---------------------------------------------------------------------------
+
+def make_sdp_offer(
+    session_id: str,
+    from_node_id: str,
+    to_node_id: str,
+    sdp: str,
+) -> dict:
+    return {
+        "type": SDP_OFFER,
+        "session_id": session_id,
+        "from_node_id": from_node_id,
+        "to_node_id": to_node_id,
+        "sdp": sdp,
+    }
+
+
+def make_sdp_answer(
+    session_id: str,
+    from_node_id: str,
+    to_node_id: str,
+    sdp: str,
+) -> dict:
+    return {
+        "type": SDP_ANSWER,
+        "session_id": session_id,
+        "from_node_id": from_node_id,
+        "to_node_id": to_node_id,
+        "sdp": sdp,
+    }
+
+
+def make_ice_candidate(
+    session_id: str,
+    from_node_id: str,
+    to_node_id: str,
+    candidate: str,
+    sdp_mid: str,
+    sdp_m_line_index: int,
+) -> dict:
+    return {
+        "type": ICE_CANDIDATE,
+        "session_id": session_id,
+        "from_node_id": from_node_id,
+        "to_node_id": to_node_id,
+        "candidate": candidate,
+        "sdp_mid": sdp_mid,
+        "sdp_m_line_index": int(sdp_m_line_index),
+    }
+
+
+def make_p2p_ready(
+    session_id: str,
+    node_id: str,
+    peer_node_id: str,
+) -> dict:
+    return {
+        "type": P2P_READY,
+        "session_id": session_id,
+        "node_id": node_id,
+        "peer_node_id": peer_node_id,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Pipeline mesh and KV management messages.
+# ---------------------------------------------------------------------------
+
+def make_pipeline_mesh(
+    session_id: str,
+    nodes: list[dict],
+    consumer: dict | None = None,
+) -> dict:
+    return {
+        "type": PIPELINE_MESH,
+        "session_id": session_id,
+        "nodes": nodes,
+        "consumer": consumer or {},
+    }
+
+
+def make_kv_trim(
+    session_id: str,
+    trim_count: int,
+) -> dict:
+    return {
+        "type": KV_TRIM,
+        "session_id": session_id,
+        "trim_count": int(trim_count),
     }
