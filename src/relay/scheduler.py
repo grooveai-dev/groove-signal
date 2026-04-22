@@ -107,7 +107,8 @@ def minimize_hops_assign(
         cap_mb = _effective_capacity_mb(node)
         if mem_per_layer > 0 and cap_mb > 0:
             max_layers = int(cap_mb / mem_per_layer)
-            max_layers = max(max_layers, 1)
+            if max_layers == 0:
+                continue
         else:
             max_layers = remaining
         count = min(max_layers, remaining)

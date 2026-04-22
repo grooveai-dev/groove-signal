@@ -118,10 +118,12 @@ def test_calculate_rebalance_no_change_yields_empty_affected():
         _caps("a", device="cuda", vram_mb=8_000),
         _caps("b", device="cuda", vram_mb=8_000),
     ]
-    new_assignments, affected = calculate_rebalance(current, caps, MODEL)
+    new_assignments, affected = calculate_rebalance(
+        current, caps, MODEL, strategy="proportional"
+    )
     assert validate_coverage(new_assignments, MODEL)
-    if new_assignments == current:
-        assert affected == []
+    assert new_assignments == current
+    assert affected == []
 
 
 def test_validate_coverage_detects_gap():
@@ -225,6 +227,29 @@ class TestMinimizeHopsAssign:
         out = assign_layers(nodes, QWEN4B, strategy="proportional")
         assert validate_coverage(out, QWEN4B)
         assert len(out) == 2
+
+    def test_tiny_node_skipped_when_below_one_layer(self):
+        """A node with less capacity than one layer is skipped entirely."""
+        nodes = [
+            _caps("big", device="cuda", vram_mb=12_000, bench_ms_per_layer=1.5),
+            _caps("tiny", device="mps", vram_mb=100, bench_ms_per_layer=5.0),
+        ]
+        out = minimize_hops_assign(nodes, QWEN4B)
+        assert validate_coverage(out, QWEN4B)
+        assert "tiny" not in out
+
+    def test_remaining_layers_correct_with_tiny_node_in_pool(self):
+        """Tiny nodes don't decrement remaining — all layers are still assigned."""
+        nodes = [
+            _caps("fast", device="cuda", vram_mb=5_000, bench_ms_per_layer=1.0),
+            _caps("tiny", device="mps", vram_mb=100, bench_ms_per_layer=3.0),
+            _caps("slow", device="mps", vram_mb=8_000, bench_ms_per_layer=6.0),
+        ]
+        out = minimize_hops_assign(nodes, QWEN4B)
+        assert validate_coverage(out, QWEN4B)
+        total_assigned = sum(end - start for start, end in out.values())
+        assert total_assigned == QWEN4B_LAYERS
+        assert "tiny" not in out
 
 
 # ---------------------------------------------------------------------------
