@@ -15,12 +15,14 @@ from __future__ import annotations
 
 import logging
 import struct
+import time
 
 logger = logging.getLogger(__name__)
 
 CHUNK_SIZE = 48 * 1024
 MAX_CHUNKS_PER_MESSAGE = 65535
 MAX_PENDING_MESSAGES = 64
+REASSEMBLY_TTL_SECONDS = 5.0
 
 HEADER_FMT = "!IIHH"
 HEADER_SIZE = struct.calcsize(HEADER_FMT)  # 12 bytes
@@ -45,18 +47,21 @@ class ChunkedChannel:
             await self._send_func(header)
             return
 
-        chunks = [data[i:i + self.chunk_size] for i in range(0, len(data), self.chunk_size)]
-        total = len(chunks)
+        total = -(-len(data) // self.chunk_size)  # ceil division
 
         if total > MAX_CHUNKS_PER_MESSAGE:
             raise ValueError(
                 f"Message requires {total} chunks, exceeds MAX_CHUNKS_PER_MESSAGE ({MAX_CHUNKS_PER_MESSAGE})"
             )
 
-        for idx, chunk in enumerate(chunks):
+        view = memoryview(data)
+        for idx in range(total):
+            start = idx * self.chunk_size
+            end = min(start + self.chunk_size, len(data))
+            chunk = view[start:end]
             flags = 1 if idx == total - 1 else 0
             header = struct.pack(HEADER_FMT, msg_id, idx, total, flags)
-            await self._send_func(header + chunk)
+            await self._send_func(header + bytes(chunk))
 
     def on_chunk_received(self, raw: bytes) -> bytes | None:
         """Process incoming chunk. Returns reassembled message when complete."""
@@ -71,6 +76,14 @@ class ChunkedChannel:
             logger.warning("invalid total_chunks=0 for message_id=%d", msg_id)
             return None
 
+        now = time.monotonic()
+        stale = [mid for mid, entry in self._reassembly.items()
+                 if now - entry['ts'] > REASSEMBLY_TTL_SECONDS]
+        for mid in stale:
+            del self._reassembly[mid]
+        if stale:
+            logger.warning('swept %d stale reassembly entries', len(stale))
+
         if msg_id not in self._reassembly:
             if len(self._reassembly) >= MAX_PENDING_MESSAGES:
                 oldest = min(self._reassembly.keys())
@@ -78,7 +91,7 @@ class ChunkedChannel:
                 logger.warning(
                     "reassembly buffer full, dropped oldest message_id=%d", oldest,
                 )
-            self._reassembly[msg_id] = {"total": total, "chunks": {}}
+            self._reassembly[msg_id] = {"total": total, "chunks": {}, "ts": now}
 
         entry = self._reassembly[msg_id]
         entry["chunks"][chunk_idx] = payload

@@ -2,6 +2,10 @@
 
 Uses aiortc to establish encrypted data channels between pipeline peers,
 bypassing the signal relay for inference data transfer.
+
+Dual-channel design:
+  tensor channel  — ordered=True,  maxRetransmits=None (reliable, for inference data)
+  control channel — ordered=False, maxRetransmits=0    (unreliable, low-latency control)
 """
 
 from __future__ import annotations
@@ -50,9 +54,12 @@ def build_rtc_config(turn_servers: list[dict] | None = None) -> RTCConfiguration
 @dataclass
 class _PeerState:
     pc: RTCPeerConnection
-    channel: object | None = None
-    recv_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
-    connected: bool = False
+    tensor_channel: object | None = None
+    control_channel: object | None = None
+    tensor_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+    control_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+    tensor_connected: bool = False
+    control_connected: bool = False
 
 
 class PeerConnectionManager:
@@ -68,44 +75,63 @@ class PeerConnectionManager:
         self._peers: dict[str, _PeerState] = {}
         self.on_ice_candidate: Callable[[str, dict], Awaitable[None]] | None = None
 
-    def _setup_channel_events(self, remote_node_id: str, channel) -> None:
+    def _setup_channel_events(self, remote_node_id: str, channel, kind: str = "tensor") -> None:
         state = self._peers[remote_node_id]
+        queue = state.tensor_queue if kind == "tensor" else state.control_queue
 
         @channel.on("open")
         def on_open():
-            state.connected = True
-            logger.info("data channel open", extra={"peer": remote_node_id})
+            if kind == "tensor":
+                state.tensor_connected = True
+            else:
+                state.control_connected = True
+            logger.info("%s channel open", kind, extra={"peer": remote_node_id})
 
         @channel.on("close")
         def on_close():
-            state.connected = False
-            logger.info("data channel closed", extra={"peer": remote_node_id})
+            if kind == "tensor":
+                state.tensor_connected = False
+            else:
+                state.control_connected = False
+            logger.info("%s channel closed", kind, extra={"peer": remote_node_id})
 
         @channel.on("message")
         def on_message(data):
-            state.recv_queue.put_nowait(data)
+            queue.put_nowait(data)
 
         if getattr(channel, "readyState", None) == "open":
-            state.connected = True
+            if kind == "tensor":
+                state.tensor_connected = True
+            else:
+                state.control_connected = True
 
     async def create_offer(self, remote_node_id: str) -> str:
-        """Create RTCPeerConnection + data channel, return SDP offer."""
+        """Create RTCPeerConnection + dual data channels, return SDP offer."""
         pc = RTCPeerConnection(configuration=self._config)
         state = _PeerState(pc=pc)
         self._peers[remote_node_id] = state
 
-        channel = pc.createDataChannel(
-            f"groove-{self._session_id}",
+        tensor_ch = pc.createDataChannel(
+            f"groove-tensor-{self._session_id}",
             ordered=True,
             maxRetransmits=None,
         )
-        state.channel = channel
-        self._setup_channel_events(remote_node_id, channel)
+        state.tensor_channel = tensor_ch
+        self._setup_channel_events(remote_node_id, tensor_ch, "tensor")
+
+        control_ch = pc.createDataChannel(
+            f"groove-control-{self._session_id}",
+            ordered=False,
+            maxRetransmits=0,
+        )
+        state.control_channel = control_ch
+        self._setup_channel_events(remote_node_id, control_ch, "control")
 
         @pc.on("connectionstatechange")
         async def on_state():
             if pc.connectionState in ("failed", "closed"):
-                state.connected = False
+                state.tensor_connected = False
+                state.control_connected = False
 
         offer = await pc.createOffer()
         await pc.setLocalDescription(offer)
@@ -119,13 +145,23 @@ class PeerConnectionManager:
 
         @pc.on("datachannel")
         def on_datachannel(channel):
-            state.channel = channel
-            self._setup_channel_events(remote_node_id, channel)
+            label = channel.label
+            if label.startswith("groove-tensor-"):
+                state.tensor_channel = channel
+                self._setup_channel_events(remote_node_id, channel, "tensor")
+            elif label.startswith("groove-control-"):
+                state.control_channel = channel
+                self._setup_channel_events(remote_node_id, channel, "control")
+            else:
+                state.tensor_channel = channel
+                self._setup_channel_events(remote_node_id, channel, "tensor")
+                state.control_connected = True
 
         @pc.on("connectionstatechange")
         async def on_state():
             if pc.connectionState in ("failed", "closed"):
-                state.connected = False
+                state.tensor_connected = False
+                state.control_connected = False
 
         offer = RTCSessionDescription(sdp=sdp_offer, type="offer")
         await pc.setRemoteDescription(offer)
@@ -155,32 +191,47 @@ class PeerConnectionManager:
         await state.pc.addIceCandidate(ice)
 
     async def send(self, remote_node_id: str, data: bytes) -> None:
-        """Send binary data over the data channel."""
+        """Send binary data over the tensor data channel."""
         state = self._peers.get(remote_node_id)
-        if state is None or state.channel is None:
+        if state is None or state.tensor_channel is None:
             raise ValueError(f"No data channel for {remote_node_id}")
-        state.channel.send(data)
+        state.tensor_channel.send(data)
+
+    async def send_control(self, remote_node_id: str, data: bytes) -> None:
+        """Send binary data over the control data channel."""
+        state = self._peers.get(remote_node_id)
+        if state is None or state.control_channel is None:
+            raise ValueError(f"No control channel for {remote_node_id}")
+        state.control_channel.send(data)
 
     async def recv(self, remote_node_id: str) -> bytes:
-        """Receive binary data from a peer's data channel."""
+        """Receive binary data from the tensor data channel."""
         state = self._peers.get(remote_node_id)
         if state is None:
             raise ValueError(f"No connection for {remote_node_id}")
-        return await state.recv_queue.get()
+        return await state.tensor_queue.get()
+
+    async def recv_control(self, remote_node_id: str) -> bytes:
+        """Receive binary data from the control data channel."""
+        state = self._peers.get(remote_node_id)
+        if state is None:
+            raise ValueError(f"No connection for {remote_node_id}")
+        return await state.control_queue.get()
 
     def is_connected(self, remote_node_id: str) -> bool:
-        """Check if the data channel is open."""
+        """Check if both data channels are open."""
         state = self._peers.get(remote_node_id)
         if state is None:
             return False
-        return state.connected
+        return state.tensor_connected and state.control_connected
 
     async def close(self, remote_node_id: str) -> None:
         """Close a specific peer connection and clean up."""
         state = self._peers.pop(remote_node_id, None)
         if state is None:
             return
-        state.connected = False
+        state.tensor_connected = False
+        state.control_connected = False
         await state.pc.close()
 
     async def close_all(self) -> None:

@@ -16,6 +16,7 @@ from src.common.chunking import (
     HEADER_FMT,
     HEADER_SIZE,
     MAX_PENDING_MESSAGES,
+    REASSEMBLY_TTL_SECONDS,
     ChunkedChannel,
 )
 
@@ -215,6 +216,61 @@ async def test_multiple_sequential_messages():
     for i, raw in enumerate(sent):
         msg_id, _, _, _ = struct.unpack(HEADER_FMT, raw[:HEADER_SIZE])
         assert msg_id == i
+
+
+@pytest.mark.asyncio
+async def test_memoryview_chunking_correctness():
+    """Large message is chunked via memoryview and reassembles correctly."""
+    ch, sent = _make_channel()
+    data = bytes(range(256)) * 4096  # ~1MB
+    await ch.send_message(data)
+
+    expected_chunks = -(-len(data) // CHUNK_SIZE)
+    assert len(sent) == expected_chunks
+
+    receiver = ChunkedChannel(lambda d: None)
+    result = None
+    for chunk in sent:
+        result = receiver.on_chunk_received(chunk)
+    assert result == data
+
+
+@pytest.mark.asyncio
+async def test_stale_reassembly_entry_swept_after_ttl():
+    """Incomplete reassembly entry is swept after REASSEMBLY_TTL_SECONDS."""
+    receiver = ChunkedChannel(lambda d: None)
+
+    stale_header = struct.pack(HEADER_FMT, 42, 0, 3, 0)
+    receiver.on_chunk_received(stale_header + b"chunk0")
+    assert 42 in receiver._reassembly
+
+    with patch("src.common.chunking.time") as mock_time:
+        mock_time.monotonic.return_value = receiver._reassembly[42]["ts"] + REASSEMBLY_TTL_SECONDS + 1.0
+        fresh_header = struct.pack(HEADER_FMT, 99, 0, 1, 1)
+        result = receiver.on_chunk_received(fresh_header + b"fresh")
+
+    assert 42 not in receiver._reassembly
+    assert result == b"fresh"
+
+
+@pytest.mark.asyncio
+async def test_64_stale_entries_dont_brick_pipeline():
+    """64 stale incomplete messages are swept, allowing new messages through."""
+    receiver = ChunkedChannel(lambda d: None)
+
+    for i in range(MAX_PENDING_MESSAGES):
+        header = struct.pack(HEADER_FMT, i, 0, 10, 0)
+        receiver.on_chunk_received(header + b"dead")
+    assert len(receiver._reassembly) == MAX_PENDING_MESSAGES
+
+    base_ts = max(entry["ts"] for entry in receiver._reassembly.values())
+    with patch("src.common.chunking.time") as mock_time:
+        mock_time.monotonic.return_value = base_ts + REASSEMBLY_TTL_SECONDS + 1.0
+        header = struct.pack(HEADER_FMT, 9999, 0, 1, 1)
+        result = receiver.on_chunk_received(header + b"alive")
+
+    assert len(receiver._reassembly) == 0
+    assert result == b"alive"
 
 
 # ---------------------------------------------------------------------------
