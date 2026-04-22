@@ -58,8 +58,9 @@ def _effective_capacity_mb(node: dict) -> float:
     device = (node.get("device") or "cpu").lower()
     vram = min(max(float(node.get("vram_mb") or 0), 0), _MAX_PLAUSIBLE_VRAM_MB)
     ram = min(max(float(node.get("ram_mb") or 0), 0), _MAX_PLAUSIBLE_RAM_MB)
+    _CUDA_OVERHEAD_MB = 512
     if device in ("cuda", "gpu", "rocm") and vram > 0:
-        return vram
+        return max(vram - _CUDA_OVERHEAD_MB, 0)
     if device == "mps" and vram > 0:
         return vram
     return ram * 0.5

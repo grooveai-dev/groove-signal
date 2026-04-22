@@ -163,6 +163,7 @@ check_python_version() {
     fi
     if (( major == 3 && minor >= 13 )); then
         warn "Python $py_version detected. PyTorch may not fully support Python 3.13+."
+        local found_compat=false
         for alt in python3.12 python3.11 python3.10; do
             if command -v "$alt" &>/dev/null; then
                 local alt_ver
@@ -171,13 +172,30 @@ check_python_version() {
                     log "Found compatible $alt ($alt_ver) on PATH — using it instead."
                     PYTHON_CMD="$alt"
                     py_version="$alt_ver"
+                    found_compat=true
                     break
                 fi
             fi
         done
-        if [[ "$PYTHON_CMD" == "python3" ]]; then
-            warn "No Python 3.10–3.12 found on PATH. Installation may fail."
-            warn "Consider installing Python 3.11 or 3.12."
+        if [[ "$found_compat" == false ]] && command -v py &>/dev/null; then
+            for pyver in 3.12 3.11 3.10; do
+                local alt_ver
+                alt_ver=$(py -"$pyver" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')" 2>/dev/null)
+                if [[ -n "$alt_ver" ]]; then
+                    log "Found compatible Python $alt_ver via py launcher — using it instead."
+                    PYTHON_CMD="py -$pyver"
+                    py_version="$alt_ver"
+                    found_compat=true
+                    break
+                fi
+            done
+        fi
+        if [[ "$found_compat" == false ]]; then
+            error "No Python 3.10–3.12 found. PyTorch requires Python 3.12 or older."
+            error "Install Python 3.12: https://www.python.org/downloads/"
+            json_error "Python $py_version not supported by PyTorch (need 3.10-3.12)" "PYTHON_VERSION"
+            JSON_ERROR_EMITTED=1
+            exit 1
         fi
     fi
     DETECTED_PY_VERSION="$py_version"
@@ -193,16 +211,37 @@ install_deps() {
     check_python_version
 
     json_emit "creating-venv" "Creating virtual environment..." 15
-    log "Creating Python virtual environment..."
-    if ! $PYTHON_CMD -m venv venv 2>&1; then
-        error "Failed to create virtual environment"
-        json_error "Failed to create virtual environment" "VENV_CREATE"
-        JSON_ERROR_EMITTED=1
-        exit 1
+    if [[ -d "venv" ]]; then
+        activate_venv
+        local venv_py_ver=""
+        venv_py_ver=$("$PYTHON_CMD" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo "")
+        local venv_minor="${venv_py_ver#3.}"
+        if [[ -n "$venv_py_ver" ]] && (( ${venv_minor:-99} >= 10 && ${venv_minor:-99} <= 12 )); then
+            log "Reusing existing venv (Python $venv_py_ver)"
+            json_emit "creating-venv" "Existing venv OK (Python $venv_py_ver)" 25
+        else
+            log "Existing venv has Python $venv_py_ver — recreating with $PYTHON_CMD..."
+            rm -rf venv
+            if ! $PYTHON_CMD -m venv venv 2>&1; then
+                error "Failed to create virtual environment"
+                json_error "Failed to create virtual environment" "VENV_CREATE"
+                JSON_ERROR_EMITTED=1
+                exit 1
+            fi
+            activate_venv
+            json_emit "creating-venv" "Virtual environment recreated" 25
+        fi
+    else
+        log "Creating Python virtual environment..."
+        if ! $PYTHON_CMD -m venv venv 2>&1; then
+            error "Failed to create virtual environment"
+            json_error "Failed to create virtual environment" "VENV_CREATE"
+            JSON_ERROR_EMITTED=1
+            exit 1
+        fi
+        activate_venv
+        json_emit "creating-venv" "Virtual environment created" 25
     fi
-    # shellcheck disable=SC1091
-    activate_venv
-    json_emit "creating-venv" "Virtual environment created" 25
 
     log "Upgrading pip..."
     "$PYTHON_CMD" -m pip install --upgrade pip --quiet >&2 2>/dev/null || "$PYTHON_CMD" -m pip install --upgrade pip --quiet

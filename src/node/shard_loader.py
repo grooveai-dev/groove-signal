@@ -157,12 +157,7 @@ def load_model_shard(
             logger.warning("bitsandbytes not available, loading without quantization")
 
     if not quantize:
-        if target_device == "cpu":
-            load_kwargs["device_map"] = "cpu"
-        elif target_device.startswith("cuda"):
-            load_kwargs["device_map"] = target_device
-        else:
-            load_kwargs["device_map"] = "cpu"
+        load_kwargs["device_map"] = "cpu"
 
     model = AutoModelForCausalLM.from_pretrained(**load_kwargs)
 
@@ -190,16 +185,14 @@ def load_model_shard(
         "total_layers": total_layers,
     }
 
-    _cleanup_unused_params(model, shard)
+    del model, inner_model, all_layers
+
+    if target_device != "cpu":
+        _move_shard_to_device(shard, target_device)
+        if target_device.startswith("cuda"):
+            torch.cuda.empty_cache()
 
     actual_device = str(next(shard["layers"].parameters()).device)
-    if target_device not in ("cpu",) and not actual_device.startswith(target_device.split(":")[0]):
-        logger.warning(
-            "Model loaded on %s but target is %s — forcing move",
-            actual_device, target_device,
-        )
-        _move_shard_to_device(shard, target_device)
-        actual_device = str(next(shard["layers"].parameters()).device)
 
     if actual_device.startswith("cuda"):
         vram_alloc = torch.cuda.memory_allocated() / (1024 * 1024)

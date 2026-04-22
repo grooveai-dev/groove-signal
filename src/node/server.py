@@ -187,8 +187,8 @@ class ComputeNodeServer:
             if shutil.which("nvidia-smi"):
                 logger.warning(
                     "Running on CPU despite NVIDIA GPU present. "
-                    "Reinstall PyTorch with CUDA: pip install torch torchvision "
-                    "torchaudio --index-url https://download.pytorch.org/whl/cu121"
+                    "Reinstall PyTorch with CUDA: pip install torch "
+                    "--index-url https://download.pytorch.org/whl/cu124 --force-reinstall"
                 )
         self.device = device
         self.max_context = max_context
