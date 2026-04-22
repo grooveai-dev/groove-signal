@@ -248,14 +248,14 @@ else:
         fi
     fi
 
-    if $need_install; then
+    install_torch() {
         local torch_ok=0
         if [[ "$gpu_type" == "cuda" ]]; then
             log "Installing PyTorch with CUDA support (this may take a few minutes)..."
-            "$PYTHON_CMD" -m pip install torch --index-url https://download.pytorch.org/whl/cu124 --timeout 300 >&2 && torch_ok=1
+            "$PYTHON_CMD" -m pip install torch --index-url https://download.pytorch.org/whl/cu124 --force-reinstall --timeout 300 >&2 && torch_ok=1
             if (( torch_ok == 0 )); then
                 log "cu124 unavailable, trying cu121..."
-                "$PYTHON_CMD" -m pip install torch --index-url https://download.pytorch.org/whl/cu121 --timeout 300 >&2 && torch_ok=1
+                "$PYTHON_CMD" -m pip install torch --index-url https://download.pytorch.org/whl/cu121 --force-reinstall --timeout 300 >&2 && torch_ok=1
             fi
         elif [[ "$gpu_type" == "mps" ]]; then
             log "Installing PyTorch with MPS (Apple Silicon) support..."
@@ -267,7 +267,11 @@ else:
             log "Installing PyTorch (Linux CPU only)..."
             "$PYTHON_CMD" -m pip install torch --index-url https://download.pytorch.org/whl/cpu >&2 && torch_ok=1
         fi
-        if (( torch_ok == 0 )); then
+        return $(( 1 - torch_ok ))
+    }
+
+    if $need_install; then
+        if ! install_torch; then
             error "Failed to install PyTorch"
             json_error "Failed to install PyTorch" "TORCH_INSTALL"
             JSON_ERROR_EMITTED=1
