@@ -121,12 +121,18 @@ async def test_dynamic_two_nodes_trigger_rebalance():
         nid_a = "0x" + "a" * 40
         nid_b = "0x" + "b" * 40
 
-        # Use limited RAM so minimize_hops must split across both nodes.
-        node_ram = 6000
+        # A is a slow CPU node (effective 3000 MB → 13 layers of Qwen3-4B).
+        # B is a fast GPU node (effective 5500 MB → 25 layers).
+        # Together 13+25=38 > 36 → full coverage after rebalance.
+        # B being faster causes minimize_hops to reorder, so A's range
+        # shifts and it receives a REBALANCE.
+        caps_a = {"ram_mb": 6000, "device": "cpu"}
+        caps_b = {"vram_mb": 5500, "device": "cuda", "bench_ms_per_layer": 1.0}
+
         ws_a = await websockets.connect(f"ws://127.0.0.1:{port}", max_size=1 << 20)
         await ws_a.send(encode_message(make_register_node(
             nid_a, layer_start=None, layer_end=None,
-            capabilities={"ram_mb": node_ram, "device": "cpu"},
+            capabilities=caps_a,
         )))
         ack_a = await _recv(ws_a)
         assert ack_a["accepted"]
@@ -145,7 +151,7 @@ async def test_dynamic_two_nodes_trigger_rebalance():
         ws_b = await websockets.connect(f"ws://127.0.0.1:{port}", max_size=1 << 20)
         await ws_b.send(encode_message(make_register_node(
             nid_b, layer_start=None, layer_end=None,
-            capabilities={"ram_mb": node_ram, "device": "cpu"},
+            capabilities=caps_b,
         )))
         ack_b = await _recv(ws_b)
         assert ack_b["accepted"]

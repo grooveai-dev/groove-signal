@@ -535,6 +535,7 @@ class RelayNode:
         except asyncio.TimeoutError:
             entry.pending_ack = None
             entry.pending_range = None
+            entry.assignment_status = "pending"
             logger.warning(
                 "assignment ack timeout",
                 extra={"node_id": entry.node_id, "kind": kind, "model": model_name},
@@ -547,15 +548,13 @@ class RelayNode:
             entry.layer_end = layer_end
             entry.assignment_status = "active"
         else:
-            # Leave assignment_status as-is; caller decides next step.
+            entry.assignment_status = "pending"
             entry.pending_range = None
         return ack
 
     async def _dynamic_assign(self, entry: NodeEntry) -> None:
         """Compute assignments for a newly joined dynamic node and dispatch."""
         async with self._sched_lock:
-            # Pick the model the network is currently serving. If none yet,
-            # default to the first registry entry (cold start).
             model_name = self._pick_model_for_new_node(entry)
             if not model_name:
                 logger.warning(
@@ -565,14 +564,16 @@ class RelayNode:
                 return
 
             current = self._active_assignments_for_model(model_name)
-            # Build capability snapshots for all participating nodes —
-            # existing actives plus the joiner — so the scheduler weights
-            # them correctly. calculate_rebalance unions on node_id.
             all_caps = [
                 {"node_id": nid, **self.nodes[nid].capabilities}
                 for nid in current
                 if nid in self.nodes
             ]
+            for nid, node_entry in self.nodes.items():
+                if (node_entry.assignment_status == "pending"
+                        and nid not in current
+                        and node_entry is not entry):
+                    all_caps.append({"node_id": nid, **node_entry.capabilities})
             all_caps.append({"node_id": entry.node_id, **entry.capabilities})
             try:
                 new_assignments, affected = calculate_rebalance(

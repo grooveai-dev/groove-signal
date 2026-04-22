@@ -113,12 +113,8 @@ def minimize_hops_assign(
         selected.append((node, count))
         remaining -= count
 
-    if remaining > 0:
-        if selected:
-            node, count = selected[-1]
-            selected[-1] = (node, count + remaining)
-        else:
-            raise ValueError("Cannot assign layers — no viable nodes")
+    if remaining > 0 and not selected:
+        raise ValueError("Cannot assign layers — no viable nodes")
 
     def _reader_score(item: tuple[dict, int]) -> float:
         node = item[0]
