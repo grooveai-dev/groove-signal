@@ -222,27 +222,6 @@ install_deps() {
     json_emit "installing-deps" "Dependencies installed" 45
 
     json_emit "installing-torch" "Installing PyTorch ($gpu_type)..." 50
-    install_torch() {
-        local torch_ok=0
-        if [[ "$gpu_type" == "cuda" ]]; then
-            log "Installing PyTorch with CUDA support..."
-            "$PYTHON_CMD" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124 --force-reinstall --no-deps --quiet && torch_ok=1
-            if (( torch_ok == 0 )); then
-                log "cu124 unavailable, trying cu121..."
-                "$PYTHON_CMD" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121 --force-reinstall --no-deps --quiet && torch_ok=1
-            fi
-        elif [[ "$gpu_type" == "mps" ]]; then
-            log "Installing PyTorch with MPS (Apple Silicon) support..."
-            "$PYTHON_CMD" -m pip install torch torchvision torchaudio --quiet && torch_ok=1
-        elif [[ "$gpu_type" == "macos-cpu" ]]; then
-            log "Installing PyTorch for macOS Intel (CPU)..."
-            "$PYTHON_CMD" -m pip install torch torchvision torchaudio --quiet && torch_ok=1
-        else
-            log "Installing PyTorch (Linux CPU only)..."
-            "$PYTHON_CMD" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu --force-reinstall --no-deps --quiet && torch_ok=1
-        fi
-        return $(( 1 - torch_ok ))
-    }
 
     # Skip PyTorch install if already present and device matches.
     local existing_device=""
@@ -270,7 +249,25 @@ else:
     fi
 
     if $need_install; then
-        if ! install_torch; then
+        local torch_ok=0
+        if [[ "$gpu_type" == "cuda" ]]; then
+            log "Installing PyTorch with CUDA support (this may take a few minutes)..."
+            "$PYTHON_CMD" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124 --timeout 300 >&2 && torch_ok=1
+            if (( torch_ok == 0 )); then
+                log "cu124 unavailable, trying cu121..."
+                "$PYTHON_CMD" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121 --timeout 300 >&2 && torch_ok=1
+            fi
+        elif [[ "$gpu_type" == "mps" ]]; then
+            log "Installing PyTorch with MPS (Apple Silicon) support..."
+            "$PYTHON_CMD" -m pip install torch torchvision torchaudio >&2 && torch_ok=1
+        elif [[ "$gpu_type" == "macos-cpu" ]]; then
+            log "Installing PyTorch for macOS Intel (CPU)..."
+            "$PYTHON_CMD" -m pip install torch torchvision torchaudio >&2 && torch_ok=1
+        else
+            log "Installing PyTorch (Linux CPU only)..."
+            "$PYTHON_CMD" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu >&2 && torch_ok=1
+        fi
+        if (( torch_ok == 0 )); then
             error "Failed to install PyTorch"
             json_error "Failed to install PyTorch" "TORCH_INSTALL"
             JSON_ERROR_EMITTED=1
