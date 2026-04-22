@@ -252,20 +252,20 @@ else:
         local torch_ok=0
         if [[ "$gpu_type" == "cuda" ]]; then
             log "Installing PyTorch with CUDA support (this may take a few minutes)..."
-            "$PYTHON_CMD" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124 --timeout 300 >&2 && torch_ok=1
+            "$PYTHON_CMD" -m pip install torch --index-url https://download.pytorch.org/whl/cu124 --timeout 300 >&2 && torch_ok=1
             if (( torch_ok == 0 )); then
                 log "cu124 unavailable, trying cu121..."
-                "$PYTHON_CMD" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121 --timeout 300 >&2 && torch_ok=1
+                "$PYTHON_CMD" -m pip install torch --index-url https://download.pytorch.org/whl/cu121 --timeout 300 >&2 && torch_ok=1
             fi
         elif [[ "$gpu_type" == "mps" ]]; then
             log "Installing PyTorch with MPS (Apple Silicon) support..."
-            "$PYTHON_CMD" -m pip install torch torchvision torchaudio >&2 && torch_ok=1
+            "$PYTHON_CMD" -m pip install torch >&2 && torch_ok=1
         elif [[ "$gpu_type" == "macos-cpu" ]]; then
             log "Installing PyTorch for macOS Intel (CPU)..."
-            "$PYTHON_CMD" -m pip install torch torchvision torchaudio >&2 && torch_ok=1
+            "$PYTHON_CMD" -m pip install torch >&2 && torch_ok=1
         else
             log "Installing PyTorch (Linux CPU only)..."
-            "$PYTHON_CMD" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu >&2 && torch_ok=1
+            "$PYTHON_CMD" -m pip install torch --index-url https://download.pytorch.org/whl/cpu >&2 && torch_ok=1
         fi
         if (( torch_ok == 0 )); then
             error "Failed to install PyTorch"
