@@ -252,10 +252,10 @@ else:
         local torch_ok=0
         if [[ "$gpu_type" == "cuda" ]]; then
             log "Installing PyTorch with CUDA support (this may take a few minutes)..."
-            "$PYTHON_CMD" -m pip install torch --index-url https://download.pytorch.org/whl/cu124 --force-reinstall --timeout 300 >&2 && torch_ok=1
+            "$PYTHON_CMD" -m pip install torch --index-url https://download.pytorch.org/whl/cu124 --timeout 300 >&2 && torch_ok=1
             if (( torch_ok == 0 )); then
                 log "cu124 unavailable, trying cu121..."
-                "$PYTHON_CMD" -m pip install torch --index-url https://download.pytorch.org/whl/cu121 --force-reinstall --timeout 300 >&2 && torch_ok=1
+                "$PYTHON_CMD" -m pip install torch --index-url https://download.pytorch.org/whl/cu121 --timeout 300 >&2 && torch_ok=1
             fi
         elif [[ "$gpu_type" == "mps" ]]; then
             log "Installing PyTorch with MPS (Apple Silicon) support..."
@@ -298,11 +298,13 @@ else:
 " 2>/dev/null || echo "cpu")
 
     # Auto-correct: GPU detected by system but PyTorch can't use it.
+    # Try to replace CPU torch with CUDA build. If it fails, ensure
+    # CPU torch still works so the node can at least run.
     if [[ "$gpu_type" == "cuda" && "$actual_device" != "cuda" ]]; then
-        warn "CUDA GPU detected but PyTorch reports CPU-only (got torch $(\"$PYTHON_CMD\" -c 'import torch; print(torch.__version__)' 2>/dev/null))"
-        warn "Force-reinstalling PyTorch with CUDA support..."
+        warn "CUDA GPU detected but PyTorch reports CPU-only"
+        warn "Attempting to install CUDA PyTorch..."
         json_emit "installing-torch" "Reinstalling PyTorch with CUDA (fixing CPU-only build)..." 82
-        if install_torch; then
+        "$PYTHON_CMD" -m pip install torch --index-url https://download.pytorch.org/whl/cu124 --force-reinstall --timeout 300 >&2 && \
             actual_device=$("$PYTHON_CMD" -c "
 import torch
 if torch.cuda.is_available():
@@ -310,9 +312,12 @@ if torch.cuda.is_available():
 else:
     print('cpu')
 " 2>/dev/null || echo "cpu")
-        fi
         if [[ "$actual_device" != "cuda" ]]; then
-            warn "Could not enable CUDA — falling back to CPU. Check NVIDIA drivers."
+            # CUDA install failed — make sure CPU torch is still usable
+            "$PYTHON_CMD" -c "import torch" 2>/dev/null || \
+                "$PYTHON_CMD" -m pip install torch --timeout 300 >&2
+            warn "Could not enable CUDA — node will run on CPU."
+            warn "To fix manually: pip install torch --index-url https://download.pytorch.org/whl/cu124 --force-reinstall"
         fi
     fi
 
