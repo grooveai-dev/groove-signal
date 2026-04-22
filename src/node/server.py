@@ -443,6 +443,22 @@ class ComputeNodeServer:
 
             try:
                 response = await self._dispatch(inner)
+            except torch.cuda.OutOfMemoryError:
+                logger.error("CUDA OOM during inference — clearing cache and reloading shard")
+                torch.cuda.empty_cache()
+                self.shard = None
+                try:
+                    self.shard = await self._load_shard_async(
+                        self.model_name, self.layer_start, self.layer_end,
+                    )
+                    logger.info("shard reloaded after OOM recovery")
+                except Exception:
+                    logger.exception("shard reload failed after OOM")
+                response = make_error(
+                    inner.get("session_id", ""), 503,
+                    "GPU out of memory — shard reloading, retry shortly",
+                )
+                response["seq_pos"] = inner.get("seq_pos")
             except Exception as exc:
                 logger.exception("dispatch failed")
                 response = make_error(
