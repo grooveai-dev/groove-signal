@@ -89,7 +89,7 @@ from src.relay.scheduler import (
     get_model_info,
     validate_coverage,
 )
-from src.node.identity import address_from_public_key, verify_signature
+from src.signal.identity import address_from_public_key, verify_signature
 from src.signal.matcher import ConsumerMatcher
 from src.signal.registry import NodeRecord, NodeRegistry
 from src.signal.scoring import configure_geoip, estimate_location_from_ip
