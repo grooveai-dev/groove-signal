@@ -254,19 +254,10 @@ install_deps() {
     gpu_type=$(detect_gpu)
     log "Detected compute device: $gpu_type"
 
-    json_emit "installing-deps" "Installing dependencies..." 30
-    log "Installing remaining dependencies..."
-    if ! "$PYTHON_CMD" -m pip install -r requirements.txt --quiet; then
-        error "Failed to install dependencies from requirements.txt"
-        json_error "Failed to install dependencies" "DEPS_INSTALL"
-        JSON_ERROR_EMITTED=1
-        exit 1
-    fi
-    json_emit "installing-deps" "Dependencies installed" 45
+    # Install PyTorch BEFORE requirements.txt so accelerate doesn't
+    # pull in the CPU-only build from PyPI.
+    json_emit "installing-torch" "Installing PyTorch ($gpu_type)..." 30
 
-    json_emit "installing-torch" "Installing PyTorch ($gpu_type)..." 50
-
-    # Skip PyTorch install if already present and device matches.
     local existing_device=""
     existing_device=$("$PYTHON_CMD" -c "
 import torch
@@ -323,7 +314,17 @@ else:
     else
         log "PyTorch already installed with $existing_device support — skipping"
     fi
-    json_emit "installing-torch" "PyTorch installed" 75
+    json_emit "installing-torch" "PyTorch installed" 50
+
+    json_emit "installing-deps" "Installing dependencies..." 55
+    log "Installing remaining dependencies..."
+    if ! "$PYTHON_CMD" -m pip install -r requirements.txt --quiet; then
+        error "Failed to install dependencies from requirements.txt"
+        json_error "Failed to install dependencies" "DEPS_INSTALL"
+        JSON_ERROR_EMITTED=1
+        exit 1
+    fi
+    json_emit "installing-deps" "Dependencies installed" 70
 
     json_emit "verifying" "Verifying installation..." 80
     log "Verifying installation..."
