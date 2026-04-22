@@ -182,11 +182,15 @@ check_python_version() {
                 local alt_ver
                 alt_ver=$(py -"$pyver" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')" 2>/dev/null)
                 if [[ -n "$alt_ver" ]]; then
-                    log "Found compatible Python $alt_ver via py launcher — using it instead."
-                    PYTHON_CMD="py -$pyver"
-                    py_version="$alt_ver"
-                    found_compat=true
-                    break
+                    local py_path
+                    py_path=$(py -"$pyver" -c "import sys; print(sys.executable)" 2>/dev/null)
+                    if [[ -n "$py_path" ]]; then
+                        log "Found compatible Python $alt_ver via py launcher ($py_path)"
+                        PYTHON_CMD="$py_path"
+                        py_version="$alt_ver"
+                        found_compat=true
+                        break
+                    fi
                 fi
             done
         fi
