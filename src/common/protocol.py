@@ -51,6 +51,8 @@ SDP_OFFER = "sdp_offer"
 SDP_ANSWER = "sdp_answer"
 ICE_CANDIDATE = "ice_candidate"
 P2P_READY = "p2p_ready"
+MESH_READY = "mesh_ready"
+MESH_BROKEN = "mesh_broken"
 
 # ---------------------------------------------------------------------------
 # M3 signal-specific message types.
@@ -70,6 +72,7 @@ ALL_MESSAGE_TYPES = frozenset({
     AUTH_CHALLENGE, AUTH_RESPONSE,
     PIPELINE_MESH, KV_TRIM,
     SDP_OFFER, SDP_ANSWER, ICE_CANDIDATE, P2P_READY,
+    MESH_READY, MESH_BROKEN,
     SIGNAL_REGISTER, SIGNAL_ACK, SIGNAL_HEARTBEAT,
     SIGNAL_QUERY, SIGNAL_MATCH, SIGNAL_DEREGISTER,
 })

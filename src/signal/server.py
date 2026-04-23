@@ -57,6 +57,8 @@ from src.common.protocol import (
     HEARTBEAT,
     ICE_CANDIDATE,
     KV_TRIM,
+    MESH_BROKEN,
+    MESH_READY,
     P2P_READY,
     PIPELINE_CONFIG,
     PIPELINE_MESH,
@@ -634,7 +636,8 @@ class SignalServer:
                     await self._forward_envelope_from_node(record, msg)
                 elif t == ASSIGNMENT_ACK:
                     self._handle_assignment_ack(record, msg)
-                elif t in (SDP_OFFER, SDP_ANSWER, ICE_CANDIDATE, P2P_READY):
+                elif t in (SDP_OFFER, SDP_ANSWER, ICE_CANDIDATE, P2P_READY,
+                           MESH_READY, MESH_BROKEN):
                     await self._forward_signaling_from_node(node_id, msg)
                 elif t in (PIPELINE_MESH, KV_TRIM):
                     sid = msg.get("stream_id") or msg.get("session_id")
@@ -820,8 +823,33 @@ class SignalServer:
             return next(iter(MODEL_REGISTRY))
         return ""
 
+    _ASSIGN_GRACE_SECONDS = 15
+
     async def _dynamic_assign(self, record: NodeRecord) -> None:
         node_id = record.node_id
+
+        model_name = self._pick_model_for_new_node(record)
+        if not model_name:
+            logger.warning(
+                "no model in registry; cannot assign",
+                extra={"node_id": node_id},
+            )
+            return
+
+        current = self._active_assignments_for_model(model_name)
+        if not current:
+            pending = [
+                nid for nid, rec in self.registry.nodes.items()
+                if rec.assignment_status in ("pending", "loading")
+            ]
+            if len(pending) < 2:
+                logger.info(
+                    "first node for %s — waiting %ds for more nodes",
+                    model_name, self._ASSIGN_GRACE_SECONDS,
+                    extra={"node_id": node_id},
+                )
+                await asyncio.sleep(self._ASSIGN_GRACE_SECONDS)
+
         async with self._sched_lock:
             live = self.registry.get_node(node_id)
             if live is None or live is not record:
@@ -833,10 +861,6 @@ class SignalServer:
 
             model_name = self._pick_model_for_new_node(record)
             if not model_name:
-                logger.warning(
-                    "no model in registry; cannot assign",
-                    extra={"node_id": node_id},
-                )
                 return
 
             current = self._active_assignments_for_model(model_name)
