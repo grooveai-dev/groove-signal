@@ -43,6 +43,18 @@ def get_model_info(model_name: str) -> dict:
 _MAX_PLAUSIBLE_VRAM_MB = 160_000
 _MAX_PLAUSIBLE_RAM_MB = 4_000_000
 
+_DEVICE_MS_HEURISTIC = {"cuda": 2.0, "gpu": 2.0, "rocm": 2.0, "mps": 5.0}
+
+
+def _inference_speed_score(node: dict) -> float:
+    """Lower = faster.  Uses bench_ms_per_layer when available,
+    otherwise falls back to device-type heuristics."""
+    bench = node.get("bench_ms_per_layer") or 0
+    if bench > 0:
+        return float(bench)
+    device = (node.get("device") or "cpu").lower()
+    return _DEVICE_MS_HEURISTIC.get(device, 20.0)
+
 
 def _effective_capacity_mb(node: dict) -> float:
     """Memory effectively usable for shard layers, in MB.
@@ -68,16 +80,18 @@ def assign_layers(
     nodes_capabilities: list[dict],
     model_name: str,
 ) -> dict[str, tuple[int, int]]:
-    """Assign contiguous layer ranges to nodes proportional to capacity.
+    """Assign contiguous layer ranges to nodes, fastest GPU on tail shard.
+
+    The tail shard (final layers + lm_head) is the most compute-intensive
+    because it includes the hidden_dim → vocab_size projection.  The fastest
+    node is reserved for the tail; remaining nodes fill early layers
+    proportional to capacity.
 
     Returns {node_id: (layer_start, layer_end_exclusive)} covering
-    [0, total_layers) with no gaps or overlaps. Each participating node
-    receives at least one layer. Nodes are ordered by capacity descending
-    so the largest node serves the earliest layers (typically slightly
-    heavier due to embedding-adjacent compute).
+    [0, total_layers) with no gaps or overlaps.
 
     Raises ValueError for unknown models, empty input, or models with
-    fewer layers than nodes (cannot give every node ≥1 layer).
+    fewer layers than nodes.
     """
     info = get_model_info(model_name)
     total_layers: int = info["total_layers"]
@@ -104,30 +118,30 @@ def assign_layers(
             )
         return {nid: (0, total_layers)}
 
-    capacities = [(node["node_id"], _effective_capacity_mb(node)) for node in nodes]
+    fastest_node = min(nodes, key=_inference_speed_score)
+    pipeline_order = [
+        node for node in nodes if node["node_id"] != fastest_node["node_id"]
+    ]
+    pipeline_order.sort(key=lambda n: _effective_capacity_mb(n), reverse=True)
+    pipeline_order.append(fastest_node)
+
+    capacities = [
+        (node["node_id"], _effective_capacity_mb(node)) for node in pipeline_order
+    ]
     total_capacity = sum(c for _, c in capacities)
 
     if total_capacity <= 0:
-        # No capacity reported — fall back to even split.
         even = total_layers // n
         remainder = total_layers - even * n
         sizes = [even + (1 if i < remainder else 0) for i in range(n)]
-        ordered_ids = [nid for nid, _ in capacities]
     else:
-        # Proportional allocation, biggest node first. Each node gets at
-        # least 1 layer; remainder distributed largest-first.
-        capacities.sort(key=lambda x: x[1], reverse=True)
-        ordered_ids = [nid for nid, _ in capacities]
         raw = [(c / total_capacity) * total_layers for _, c in capacities]
         sizes = [max(1, int(r)) for r in raw]
 
-        # Reconcile to exactly total_layers.
         diff = total_layers - sum(sizes)
         if diff > 0:
-            # Distribute extra layers to nodes with the largest fractional
-            # remainders (largest first as tiebreak — they're already sorted).
             fracs = sorted(
-                enumerate(raw), key=lambda x: x[1] - int(x[1]), reverse=True
+                enumerate(raw), key=lambda x: x[1] - int(x[1]), reverse=True,
             )
             i = 0
             while diff > 0:
@@ -136,7 +150,6 @@ def assign_layers(
                 diff -= 1
                 i += 1
         elif diff < 0:
-            # Trim from the smallest assignments first, but never below 1.
             order = sorted(range(n), key=lambda i: sizes[i])
             i = 0
             while diff < 0:
@@ -145,14 +158,14 @@ def assign_layers(
                     sizes[idx] -= 1
                     diff += 1
                 i += 1
-                if i > 10 * n:  # pathological safety
+                if i > 10 * n:
                     raise ValueError(
                         "Cannot fit layers — too many nodes for model size"
                     )
 
     assignments: dict[str, tuple[int, int]] = {}
     cursor = 0
-    for nid, size in zip(ordered_ids, sizes):
+    for (nid, _), size in zip(capacities, sizes):
         assignments[nid] = (cursor, cursor + size)
         cursor += size
     return assignments
